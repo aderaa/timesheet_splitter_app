@@ -813,8 +813,13 @@ def run_main_page(config: dict, lang: str):
         full_file = st.file_uploader(t("full_timesheet", lang), type=["xlsx"])
     with col2:
         if db_loaded_from_config:
-            st.success(f"{t('db_loaded_from_config', lang)}\n{resolved_db_path}")
-            db_file = st.file_uploader(t("db_upload_optional", lang), type=["xlsx"])
+            # Small visual hint only: label + ✅, no big success box
+            label = f"{t('vendor_db', lang)} ✅"
+            db_file = st.file_uploader(
+                label,
+                type=["xlsx"],
+                help=t("db_upload_optional", lang),  # optional override
+            )
         else:
             if db_error_msg:
                 st.warning(db_error_msg)
@@ -1277,7 +1282,7 @@ def main():
         )
         if st.session_state["page"] == "main":
             st.markdown(
-                f"<div class='welcome-line'>👋 Welcome, {user_name}</div>",
+                f"<div class='welcome-line'>👋 Welcome, {user_name} – {dept}</div>",
                 unsafe_allow_html=True,
             )
     with col_gear:
