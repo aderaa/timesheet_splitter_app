@@ -1,6 +1,7 @@
 # Ignore output folder
 output/
-
+build/
+dist/
 
 # Ignore config file
 # app.config
