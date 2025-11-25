@@ -3,6 +3,7 @@ import io
 import re
 import shutil
 import zipfile
+import json
 from datetime import datetime
 
 import pandas as pd
@@ -14,23 +15,27 @@ import streamlit as st
 try:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
 
-# ==== Configuration (column names, etc.) ====
+# ==== Paths & Config ====
+
+APP_ROOT = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+APP_CONFIG_FILE = os.path.join(APP_ROOT, "app.config")
 
 # Columns in "1.Full Timesheet Report.xlsx"
 FULL_EMP_ID_COL = "EMP ID"
 FULL_EMP_NAME_COL = "User Name"
 FULL_DATE_COL = "Date"
 FULL_HOURS_COL = "Regular Time (Hours)"
-FULL_PROJECT_TYPE_COL = "Project Type"
+FULL_PROJECT_TYPE_COL = "Project Type"  # column used for ignore list (e.g. "On Bench")
 
-# Columns in "3.Databse.xlsx"
+# Columns in "3.Databse.xlsx" / database file
 DB_EMP_ID_COL = "Emp ID"
 DB_EMP_NAME_COL = "Employee Name"
 DB_VENDOR_COL = "Organization"
@@ -42,6 +47,17 @@ DEFAULT_VENDOR_NAME = "UnAssigned Vendor"
 
 # Default ignore list for Project Type
 DEFAULT_IGNORE_LIST = ["On Bench"]
+
+DEFAULT_CONFIG = {
+    "database_path": "Database.xlsx",          # relative to app root
+    "ignore_project_types": DEFAULT_IGNORE_LIST,
+    "logo_path": "malomatia-logo.png",         # relative to app root
+    "department_name": "Digital Services",
+    "user_name": "Malomatian",
+    "default_output_mode": "folder",           # "folder" or "zip"
+    "default_output_folder": "output",
+    "language": "English",                     # persisted language preference
+}
 
 
 # ==== Simple i18n helper ====
@@ -57,7 +73,6 @@ TEXT = {
         "output_folder": "Target output folder (relative or absolute path)",
         "full_timesheet": "1) Full Timesheet Report (from Clarity)",
         "vendor_db": "2) Vendor / Employee Database",
-        "sample_file": "Optional: Example of single-user timesheet (for reference only)",
         "folder_not_empty": "⚠️ The folder '{path}' is not empty. Its contents will be deleted before export.",
         "confirm_clear": "I understand, clear this folder before export",
         "start": "🚀 Start splitting",
@@ -79,7 +94,7 @@ TEXT = {
         "ignored_table_title": "Ignored employees (not in DB & not P*)",
         "failed_table_title": "Failed splits",
         "unassigned_table_title": "Unassigned 'P*' employees (default vendor)",
-        "project_ignored_table_title": "Employees with Project Types in ignore list",
+        "project_ignored_table_title": "Employees with Project Types in ignore list (NOT exported)",
         "no_failed": "No failed splits 🎉",
         "no_ignored": "No ignored employees 🎉",
         "no_unassigned": "No unassigned 'P*' employees 🎉",
@@ -94,7 +109,7 @@ TEXT = {
         "doc_section_ignored": "4. Ignored employees (not in vendor database and not starting with 'P')",
         "doc_section_failed": "5. Failed splits",
         "doc_section_unassigned": "6. 'P*' employees not in vendor DB (assigned to default vendor)",
-        "doc_section_project_ignored": "7. Employees with Project Types in ignore list",
+        "doc_section_project_ignored": "7. Employees with Project Types in ignore list (NOT exported)",
         "doc_overview_bullet_1": "Run timestamp: {ts}",
         "doc_overview_bullet_2": "Timesheet period: {period}",
         "doc_overview_bullet_3": "Total unique employees in source: {total}",
@@ -102,7 +117,7 @@ TEXT = {
         "doc_overview_bullet_5": "Ignored employees (not in DB & not P*): {ignored}",
         "doc_overview_bullet_6": "Failed splits: {failed}",
         "doc_overview_bullet_7": "Unassigned 'P*' employees (default vendor): {unassigned}",
-        "doc_overview_bullet_8": "Employees with project types in ignore list: {project_flagged}",
+        "doc_overview_bullet_8": "Employees with project types in ignore list (NOT exported): {project_flagged}",
         "table_vendor": "Vendor",
         "table_vendor_hours": "Total hours",
         "table_vendor_emp_count": "Employees",
@@ -118,8 +133,33 @@ TEXT = {
         "ui_language": "Language / اللغة",
         "ui_language_en": "English",
         "ui_language_ar": "العربية",
-        "ignore_list": "Project Types to flag (comma-separated)",
+        "ignore_list": "Ignored Project Types (from config)",
         "pdf_not_available": "PDF generation library (reportlab) is not installed. Only Excel files will be generated. Please run: pip install reportlab",
+        "vendor_staff_header_emp_count": "Employees count",
+        "vendor_staff_header_total_hours": "Total hours",
+        "vendor_staff_header_avg_hours": "Average hours per employee",
+        "sidebar_page_main": "Timesheet Splitter",
+        "sidebar_page_settings": "App Settings",
+        "config_title": "Application Configuration",
+        "config_section_paths": "Paths & Files",
+        "config_db_path": "Vendor / Employee DB file path (relative to app root or absolute)",
+        "config_logo_path": "Logo image path (relative to app root or absolute)",
+        "config_section_branding": "Branding",
+        "config_department_name": "Department name",
+        "config_user_name": "Default user name",
+        "config_section_output": "Output Defaults",
+        "config_default_output_mode": "Default output mode",
+        "config_default_output_folder": "Default output folder",
+        "config_section_ignore": "Ignored Project Types (Project Type column)",
+        "config_save_button": "💾 Save configuration",
+        "config_saved": "Configuration saved.",
+        "config_logo_preview": "Logo preview",
+        "config_db_resolved": "Resolved DB path",
+        "db_loaded_from_config": "Loaded vendor DB from config path:",
+        "db_config_missing": "Configured DB file not found at:",
+        "db_config_error": "Error reading DB file from configured path:",
+        "db_upload_optional": "Override Vendor / Employee Database (optional)",
+        "sidebar_lang": "Language / اللغة",
     },
     "ar": {
         "title": "أداة تقسيم الجداول الزمنية للموظفين الخارجيين",
@@ -131,7 +171,6 @@ TEXT = {
         "output_folder": "مسار مجلد الإخراج (نسبي أو مطلق)",
         "full_timesheet": "١) ملف الجداول الزمنية الكامل (من Clarity)",
         "vendor_db": "٢) ملف قاعدة بيانات الموردين / الموظفين",
-        "sample_file": "اختياري: مثال لجدول زمني لموظف واحد (للمرجع فقط)",
         "folder_not_empty": "⚠️ المجلد '{path}' غير فارغ. سيتم حذف محتوياته قبل التصدير.",
         "confirm_clear": "أقرّ بذلك، قم بإفراغ هذا المجلد قبل التصدير",
         "start": "🚀 ابدأ عملية التقسيم",
@@ -144,18 +183,18 @@ TEXT = {
         "metrics_title": "ملخص العملية",
         "metric_total_emps": "عدد الموظفين في المصدر",
         "metric_exported_emps": "عدد الموظفين الذين تم تصديرهم",
-        "metric_ignored_emps": "الموظفون المتجاهلون (غير موجودين بقاعدة البيانات ولا يبدأ رقمهم بـ P)",
+        "metric_ignored_emps": "الموظفون المتجاهَلون (غير موجودين بقاعدة البيانات ولا يبدأ رقمهم بـ P)",
         "metric_failed_emps": "عدد المحاولات الفاشلة",
         "metric_unassigned_emps": "موظفو P غير المربوطين بمورد",
         "metric_project_flagged_emps": "موظفون لديهم نوع مشروع من قائمة التجاهل",
         "vendor_summary_title": "ساعات العمل لكل مورد",
         "exported_table_title": "الموظفون الذين تم تصديرهم",
-        "ignored_table_title": "الموظفون المتجاهلون (غير موجودين بقاعدة البيانات ولا يبدأ رقمهم بـ P)",
+        "ignored_table_title": "الموظفون المتجاهَلون (غير موجودين بقاعدة البيانات ولا يبدأ رقمهم بـ P)",
         "failed_table_title": "المحاولات الفاشلة",
         "unassigned_table_title": "الموظفون الذين يبدأ رقمهم بـ P وغير موجودين بقاعدة البيانات (المورد الافتراضي)",
-        "project_ignored_table_title": "الموظفون الذين لديهم نوع مشروع ضمن قائمة التجاهل",
+        "project_ignored_table_title": "الموظفون الذين لديهم أنواع مشروع ضمن قائمة التجاهل (لا يتم تصديرهم)",
         "no_failed": "لا توجد محاولات فاشلة 🎉",
-        "no_ignored": "لا يوجد موظفون متجاهلون 🎉",
+        "no_ignored": "لا يوجد موظفون متجاهَلون 🎉",
         "no_unassigned": "لا يوجد موظفو P غير مربوطين بمورد 🎉",
         "no_project_flagged": "لا يوجد موظفون لديهم أنواع مشروع من قائمة التجاهل 🎉",
         "run_timestamp": "تاريخ ووقت التشغيل",
@@ -165,18 +204,18 @@ TEXT = {
         "doc_section_overview": "١. نظرة عامة",
         "doc_section_vendor_summary": "٢. ساعات العمل لكل مورد",
         "doc_section_exported_emps": "٣. الموظفون الذين تم تصديرهم",
-        "doc_section_ignored": "٤. الموظفون المتجاهلون (غير موجودين في قاعدة بيانات الموردين ولا يبدأ رقمهم بـ P)",
+        "doc_section_ignored": "٤. الموظفون المتجاهَلون (غير موجودين في قاعدة بيانات الموردين ولا يبدأ رقمهم بـ P)",
         "doc_section_failed": "٥. المحاولات الفاشلة",
         "doc_section_unassigned": "٦. الموظفون الذين يبدأ رقمهم بـ P وغير موجودين في قاعدة بيانات الموردين (المورد الافتراضي)",
-        "doc_section_project_ignored": "٧. الموظفون الذين لديهم أنواع مشروع ضمن قائمة التجاهل",
+        "doc_section_project_ignored": "٧. الموظفون الذين لديهم أنواع مشروع ضمن قائمة التجاهل (لا يتم تصديرهم)",
         "doc_overview_bullet_1": "تاريخ ووقت التشغيل: {ts}",
         "doc_overview_bullet_2": "فترة الجداول الزمنية: {period}",
         "doc_overview_bullet_3": "إجمالي عدد الموظفين في المصدر: {total}",
         "doc_overview_bullet_4": "عدد الموظفين الذين تم تصديرهم: {exported}",
-        "doc_overview_bullet_5": "عدد الموظفين المتجاهلين (غير موجودين في قاعدة البيانات ولا يبدأ رقمهم بـ P): {ignored}",
+        "doc_overview_bullet_5": "عدد الموظفين المتجاهَلين (غير موجودين في قاعدة البيانات ولا يبدأ رقمهم بـ P): {ignored}",
         "doc_overview_bullet_6": "عدد المحاولات الفاشلة: {failed}",
         "doc_overview_bullet_7": "عدد موظفي P غير المربوطين بمورد (المورد الافتراضي): {unassigned}",
-        "doc_overview_bullet_8": "عدد الموظفين الذين لديهم نوع مشروع ضمن قائمة التجاهل: {project_flagged}",
+        "doc_overview_bullet_8": "عدد الموظفين الذين لديهم نوع مشروع ضمن قائمة التجاهل (لا يتم تصديرهم): {project_flagged}",
         "table_vendor": "المورد",
         "table_vendor_hours": "إجمالي الساعات",
         "table_vendor_emp_count": "عدد الموظفين",
@@ -192,8 +231,33 @@ TEXT = {
         "ui_language": "Language / اللغة",
         "ui_language_en": "English",
         "ui_language_ar": "العربية",
-        "ignore_list": "قائمة أنواع المشروع المطلوب تمييزها (مفصولة بفواصل)",
+        "ignore_list": "أنواع المشروع المتجاهَلة (من إعدادات التطبيق)",
         "pdf_not_available": "مكتبة إنشاء ملفات PDF (reportlab) غير مثبتة، سيتم إنشاء ملفات Excel فقط. برجاء تنفيذ الأمر: pip install reportlab",
+        "vendor_staff_header_emp_count": "عدد الموظفين",
+        "vendor_staff_header_total_hours": "إجمالي الساعات",
+        "vendor_staff_header_avg_hours": "متوسط الساعات لكل موظف",
+        "sidebar_page_main": "أداة التقسيم",
+        "sidebar_page_settings": "إعدادات التطبيق",
+        "config_title": "إعدادات التطبيق",
+        "config_section_paths": "المسارات والملفات",
+        "config_db_path": "مسار ملف قاعدة بيانات الموردين / الموظفين (نسبي من مجلد التطبيق أو مطلق)",
+        "config_logo_path": "مسار شعار الجهة (نسبي من مجلد التطبيق أو مطلق)",
+        "config_section_branding": "الهوية (Branding)",
+        "config_department_name": "اسم الإدارة / القسم",
+        "config_user_name": "اسم المستخدم الافتراضي",
+        "config_section_output": "إعدادات الإخراج الافتراضية",
+        "config_default_output_mode": "طريقة الإخراج الافتراضية",
+        "config_default_output_folder": "مجلد الإخراج الافتراضي",
+        "config_section_ignore": "أنواع المشروع المتجاهَلة (عمود Project Type)",
+        "config_save_button": "💾 حفظ الإعدادات",
+        "config_saved": "تم حفظ الإعدادات.",
+        "config_logo_preview": "معاينة الشعار",
+        "config_db_resolved": "المسار الفعلي لملف قاعدة البيانات",
+        "db_loaded_from_config": "تم تحميل ملف قاعدة بيانات الموردين من مسار الإعدادات:",
+        "db_config_missing": "لم يتم العثور على ملف قاعدة بيانات الموردين في المسار التالي:",
+        "db_config_error": "خطأ أثناء قراءة ملف قاعدة البيانات من المسار المحدد:",
+        "db_upload_optional": "رفع ملف قاعدة بيانات بديل (اختياري)",
+        "sidebar_lang": "Language / اللغة",
     },
 }
 
@@ -207,15 +271,25 @@ def t(key: str, lang: str) -> str:
 CUSTOM_CSS = """
 <style>
 .app-title {
-    text-align: center;
+    text-align: left;
     color: #2c3e50;
     font-size: 2.3rem;
     margin-bottom: 0.2rem;
 }
 .app-subtitle {
-    text-align: center;
+    text-align: left;
     color: #555;
-    margin-bottom: 1.5rem;
+    margin-bottom: 0.3rem;
+}
+.brand-line {
+    color: #333;
+    font-size: 0.95rem;
+    margin-bottom: 0.3rem;
+}
+.welcome-line {
+    color: #2c3e50;
+    font-size: 1.1rem;
+    margin-bottom: 1.2rem;
 }
 .summary-card {
     padding: 0.9rem 1.2rem;
@@ -228,6 +302,29 @@ CUSTOM_CSS = """
 """
 
 
+# ==== Config helpers ====
+
+def load_app_config() -> dict:
+    cfg = DEFAULT_CONFIG.copy()
+    if os.path.exists(APP_CONFIG_FILE):
+        try:
+            with open(APP_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                cfg.update(data)
+        except Exception:
+            pass
+    return cfg
+
+
+def save_app_config(cfg: dict) -> None:
+    try:
+        with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 # ==== Core helpers ====
 
 def safe_name(name: str) -> str:
@@ -235,26 +332,77 @@ def safe_name(name: str) -> str:
     if pd.isna(name):
         name = "Unknown"
     name = str(name)
-    # Replace characters not allowed in Windows filenames
     return re.sub(r'[<>:"/\\\\|?*]', "_", name)
 
 
+def resolve_path_from_config(path_value: str) -> str:
+    """Resolve a path from config: absolute or relative to APP_ROOT."""
+    if not path_value:
+        return ""
+    path_value = str(path_value)
+    if os.path.isabs(path_value):
+        return path_value
+    return os.path.join(APP_ROOT, path_value)
+
+
 def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
-    """Render a pandas DataFrame to a simple table PDF and return bytes."""
+    """Render a pandas DataFrame to a table PDF, word-wrapped and fitted to landscape A4 width."""
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("reportlab is not installed")
 
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4))
+
+    page_size = landscape(A4)
+    page_width, page_height = page_size
+    left_margin = right_margin = top_margin = bottom_margin = 20
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=page_size,
+        leftMargin=left_margin,
+        rightMargin=right_margin,
+        topMargin=top_margin,
+        bottomMargin=bottom_margin,
+    )
+
     elements = []
     styles = getSampleStyleSheet()
+
+    header_style = ParagraphStyle(
+        "HeaderCell",
+        parent=styles["Normal"],
+        fontSize=8,
+        leading=10,
+        alignment=1,  # center
+    )
+    cell_style = ParagraphStyle(
+        "TableCell",
+        parent=styles["Normal"],
+        fontSize=7,
+        leading=9,
+        wordWrap="CJK",
+    )
 
     if title:
         elements.append(Paragraph(title, styles["Heading2"]))
 
-    # Build table data
-    data = [list(df.columns)] + df.astype(str).values.tolist()
-    table = Table(data, repeatRows=1)
+    if df is None or df.empty:
+        df = pd.DataFrame({"": ["(no data)"]})
+
+    df_str = df.astype(str)
+
+    header_row = [Paragraph(str(col), header_style) for col in df_str.columns]
+    data_rows = []
+    for _, row in df_str.iterrows():
+        data_rows.append([Paragraph(str(val), cell_style) for val in row])
+
+    data = [header_row] + data_rows
+
+    ncols = len(df_str.columns) or 1
+    avail_width = page_width - left_margin - right_margin
+    col_widths = [avail_width / ncols] * ncols
+
+    table = Table(data, colWidths=col_widths, repeatRows=1)
 
     style = TableStyle(
         [
@@ -262,13 +410,15 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
             ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("ALIGN", (0, 1), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ]
     )
     table.setStyle(style)
-    elements.append(table)
 
+    elements.append(table)
     doc.build(elements)
     buffer.seek(0)
     return buffer.getvalue()
@@ -283,11 +433,9 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
     - project_flagged: employees whose rows contain project types from ignore_list (NOT exported)
     """
 
-    # Handle merged cells: forward-fill object columns
     obj_cols = full_df.select_dtypes(include=["object"]).columns
     full_df[obj_cols] = full_df[obj_cols].ffill()
 
-    # Normalize date & hours columns
     if FULL_DATE_COL in full_df.columns:
         full_df[FULL_DATE_COL] = pd.to_datetime(full_df[FULL_DATE_COL], errors="coerce")
     if FULL_HOURS_COL in full_df.columns:
@@ -295,7 +443,6 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
     else:
         full_df[FULL_HOURS_COL] = 0.0
 
-    # Vendor mapping
     db_df = db_df.copy()
     emp_id_to_vendor = {}
     emp_id_to_name = {}
@@ -320,13 +467,12 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
             if emp_name is not None and not pd.isna(emp_name):
                 emp_id_to_name[emp_id] = emp_name
 
-    # Prepare ignore list for Project Type
     ignore_set = {v.strip().lower() for v in ignore_list if v and isinstance(v, str)}
 
-    employees = []          # WILL be exported
-    ignored = []            # not in DB & not P*
-    unassigned = []         # P* not in DB → default vendor
-    project_flagged = []    # hit ignore list → REPORTED ONLY, NOT EXPORTED
+    employees = []
+    ignored = []
+    unassigned = []
+    project_flagged = []
 
     if FULL_EMP_ID_COL not in full_df.columns or FULL_EMP_NAME_COL not in full_df.columns:
         raise ValueError("Full timesheet file is missing required columns.")
@@ -343,11 +489,10 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
         emp_name = str(emp_name_series.iloc[0]) if not emp_name_series.empty else ""
         total_hours = float(emp_rows[FULL_HOURS_COL].sum())
 
-        # --- Determine vendor / ignored / unassigned ---
         is_unassigned = False
 
         if emp_id not in emp_id_to_vendor:
-            if emp_id.startswith("P"):  # assign to default vendor
+            if emp_id.startswith("P"):
                 vendor = DEFAULT_VENDOR_NAME
                 is_unassigned = True
                 unassigned.append(
@@ -359,7 +504,6 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
                     }
                 )
             else:
-                # completely ignored (not exported)
                 ignored.append(
                     {
                         "Emp ID": emp_id,
@@ -372,7 +516,6 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
         else:
             vendor = emp_id_to_vendor[emp_id]
 
-        # --- Check for ignored Project Types ---
         has_ignored_pt = False
         matched_pts = []
         if has_project_type_col and ignore_set:
@@ -381,7 +524,6 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
             if matched:
                 has_ignored_pt = True
                 matched_pts = matched
-                # This employee is REPORTED ONLY, NOT exported
                 project_flagged.append(
                     {
                         "Vendor": vendor,
@@ -391,10 +533,8 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
                         "IgnoredProjectTypes": matched_pts,
                     }
                 )
-                # 🚫 DO NOT export them
                 continue
 
-        # --- If we reach here, employee WILL be exported ---
         employees.append(
             {
                 "Vendor": vendor,
@@ -410,8 +550,8 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
 
     return employees, ignored, unassigned, project_flagged, unique_emp_ids
 
+
 def build_summary_structures(employees, ignored, failed, unassigned, project_flagged, full_df, lang: str):
-    """Prepare data for UI + DOCX summary."""
     now = datetime.now()
     if FULL_DATE_COL in full_df.columns:
         dates = full_df[FULL_DATE_COL].dropna()
@@ -440,7 +580,6 @@ def build_summary_structures(employees, ignored, failed, unassigned, project_fla
         "project_flagged_emps": project_flagged_emps,
     }
 
-    # Vendor summary
     vendor_summary_rows = []
     vendor_group = {}
     for e in employees:
@@ -459,7 +598,6 @@ def build_summary_structures(employees, ignored, failed, unassigned, project_fla
         )
     vendor_summary_df = pd.DataFrame(vendor_summary_rows)
 
-    # Exported employees table
     exported_rows = []
     for e in employees:
         exported_rows.append(
@@ -472,7 +610,6 @@ def build_summary_structures(employees, ignored, failed, unassigned, project_fla
         )
     exported_df = pd.DataFrame(exported_rows)
 
-    # Ignored table (not in DB & not P*)
     ignored_rows = []
     for ig in ignored:
         ignored_rows.append(
@@ -485,7 +622,6 @@ def build_summary_structures(employees, ignored, failed, unassigned, project_fla
         )
     ignored_df = pd.DataFrame(ignored_rows)
 
-    # Failed table
     failed_rows = []
     for fl in failed:
         failed_rows.append(
@@ -498,7 +634,6 @@ def build_summary_structures(employees, ignored, failed, unassigned, project_fla
         )
     failed_df = pd.DataFrame(failed_rows)
 
-    # Unassigned P* employees table
     unassigned_rows = []
     for u in unassigned:
         unassigned_rows.append(
@@ -512,7 +647,6 @@ def build_summary_structures(employees, ignored, failed, unassigned, project_fla
         )
     unassigned_df = pd.DataFrame(unassigned_rows)
 
-    # Employees with ignored Project Types
     proj_rows = []
     for p in project_flagged:
         proj_rows.append(
@@ -539,12 +673,10 @@ def build_docx_summary(
     project_flagged_df,
     lang: str,
 ) -> Document:
-    """Generate the DOCX summary report."""
     doc = Document()
 
     doc.add_heading(t("summary_doc_title", lang), level=0)
 
-    # Overview
     doc.add_heading(t("doc_section_overview", lang), level=1)
     ts_str = summary_stats["run_timestamp"].strftime("%Y-%m-%d %H:%M:%S")
     period_str = summary_stats["period"]
@@ -568,156 +700,136 @@ def build_docx_summary(
     for b in bullets:
         doc.add_paragraph(b, style="List Bullet")
 
-    # Vendor summary
-    doc.add_heading(t("doc_section_vendor_summary", lang), level=1)
-    if vendor_summary_df is not None and not vendor_summary_df.empty:
-        cols = list(vendor_summary_df.columns)
-        table = doc.add_table(rows=1 + len(vendor_summary_df), cols=len(cols))
-        hdr_cells = table.rows[0].cells
-        for j, c in enumerate(cols):
-            hdr_cells[j].text = str(c)
-
-        for i, (_, row) in enumerate(vendor_summary_df.iterrows(), start=1):
-            row_cells = table.rows[i].cells
+    def add_table_section(title_key, df):
+        doc.add_heading(t(title_key, lang), level=1)
+        if df is not None and not df.empty:
+            cols = list(df.columns)
+            table = doc.add_table(rows=1 + len(df), cols=len(cols))
+            hdr_cells = table.rows[0].cells
             for j, c in enumerate(cols):
-                row_cells[j].text = str(row[c])
-    else:
-        doc.add_paragraph("—")
+                hdr_cells[j].text = str(c)
+            for i, (_, row) in enumerate(df.iterrows(), start=1):
+                row_cells = table.rows[i].cells
+                for j, c in enumerate(cols):
+                    row_cells[j].text = str(row[c])
+        else:
+            doc.add_paragraph("—")
 
-    # Exported employees
-    doc.add_heading(t("doc_section_exported_emps", lang), level=1)
-    if exported_df is not None and not exported_df.empty:
-        cols = list(exported_df.columns)
-        table = doc.add_table(rows=1 + len(exported_df), cols=len(cols))
-        hdr_cells = table.rows[0].cells
-        for j, c in enumerate(cols):
-            hdr_cells[j].text = str(c)
-
-        for i, (_, row) in enumerate(exported_df.iterrows(), start=1):
-            row_cells = table.rows[i].cells
-            for j, c in enumerate(cols):
-                row_cells[j].text = str(row[c])
-    else:
-        doc.add_paragraph("—")
-
-    # Ignored employees
-    doc.add_heading(t("doc_section_ignored", lang), level=1)
-    if ignored_df is not None and not ignored_df.empty:
-        cols = list(ignored_df.columns)
-        table = doc.add_table(rows=1 + len(ignored_df), cols=len(cols))
-        hdr_cells = table.rows[0].cells
-        for j, c in enumerate(cols):
-            hdr_cells[j].text = str(c)
-
-        for i, (_, row) in enumerate(ignored_df.iterrows(), start=1):
-            row_cells = table.rows[i].cells
-            for j, c in enumerate(cols):
-                row_cells[j].text = str(row[c])
-    else:
-        doc.add_paragraph("—")
-
-    # Failed splits
-    doc.add_heading(t("doc_section_failed", lang), level=1)
-    if failed_df is not None and not failed_df.empty:
-        cols = list(failed_df.columns)
-        table = doc.add_table(rows=1 + len(failed_df), cols=len(cols))
-        hdr_cells = table.rows[0].cells
-        for j, c in enumerate(cols):
-            hdr_cells[j].text = str(c)
-
-        for i, (_, row) in enumerate(failed_df.iterrows(), start=1):
-            row_cells = table.rows[i].cells
-            for j, c in enumerate(cols):
-                row_cells[j].text = str(row[c])
-    else:
-        doc.add_paragraph("—")
-
-    # Unassigned P* employees
-    doc.add_heading(t("doc_section_unassigned", lang), level=1)
-    if unassigned_df is not None and not unassigned_df.empty:
-        cols = list(unassigned_df.columns)
-        table = doc.add_table(rows=1 + len(unassigned_df), cols=len(cols))
-        hdr_cells = table.rows[0].cells
-        for j, c in enumerate(cols):
-            hdr_cells[j].text = str(c)
-
-        for i, (_, row) in enumerate(unassigned_df.iterrows(), start=1):
-            row_cells = table.rows[i].cells
-            for j, c in enumerate(cols):
-                row_cells[j].text = str(row[c])
-    else:
-        doc.add_paragraph("—")
-
-    # Employees with ignored Project Types
-    doc.add_heading(t("doc_section_project_ignored", lang), level=1)
-    if project_flagged_df is not None and not project_flagged_df.empty:
-        cols = list(project_flagged_df.columns)
-        table = doc.add_table(rows=1 + len(project_flagged_df), cols=len(cols))
-        hdr_cells = table.rows[0].cells
-        for j, c in enumerate(cols):
-            hdr_cells[j].text = str(c)
-
-        for i, (_, row) in enumerate(project_flagged_df.iterrows(), start=1):
-            row_cells = table.rows[i].cells
-            for j, c in enumerate(cols):
-                row_cells[j].text = str(row[c])
-    else:
-        doc.add_paragraph("—")
+    add_table_section("doc_section_vendor_summary", vendor_summary_df)
+    add_table_section("doc_section_exported_emps", exported_df)
+    add_table_section("doc_section_ignored", ignored_df)
+    add_table_section("doc_section_failed", failed_df)
+    add_table_section("doc_section_unassigned", unassigned_df)
+    add_table_section("doc_section_project_ignored", project_flagged_df)
 
     return doc
 
 
-# ==== Streamlit app ====
+def build_vendor_staff_summary_df(vendor: str, employees_for_summary: list, lang: str) -> pd.DataFrame:
+    col_emp_id = t("table_emp_id", lang)
+    col_emp_name = t("table_emp_name", lang)
+    col_emp_hours = t("table_emp_hours", lang)
 
-def main():
-    st.set_page_config(page_title="Timesheet Splitter", page_icon="⏱️", layout="wide")
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    label_emp_count = t("vendor_staff_header_emp_count", lang)
+    label_total_hours = t("vendor_staff_header_total_hours", lang)
+    label_avg_hours = t("vendor_staff_header_avg_hours", lang)
 
-    # Language selector
-    if "lang" not in st.session_state:
-        st.session_state["lang"] = "en"
+    rows = []
+    total_hours = 0.0
 
-    lang = st.sidebar.radio(
-        t("ui_language", st.session_state["lang"]),
-        ("en", "ar"),
-        index=0,
-        format_func=lambda x: t(f"ui_language_{x}", st.session_state["lang"]),
-    )
-    st.session_state["lang"] = lang
-    lang = st.session_state["lang"]
+    for emp in employees_for_summary:
+        rows.append(
+            {
+                col_emp_id: emp["Emp ID"],
+                col_emp_name: emp["Employee Name"],
+                col_emp_hours: round(emp["Total Hours"], 2),
+            }
+        )
+        total_hours += float(emp["Total Hours"])
 
-    st.markdown(f"<h1 class='app-title'>⏱️ {t('title', lang)}</h1>", unsafe_allow_html=True)
-    st.markdown(f"<p class='app-subtitle'>{t('subtitle', lang)}</p>", unsafe_allow_html=True)
+    count = len(rows)
+    avg_hours = total_hours / count if count else 0.0
 
+    if rows:
+        rows.append({col_emp_id: "", col_emp_name: "", col_emp_hours: ""})
+        rows.append({col_emp_id: "", col_emp_name: label_emp_count, col_emp_hours: count})
+        rows.append({col_emp_id: "", col_emp_name: label_total_hours, col_emp_hours: round(total_hours, 2)})
+        rows.append({col_emp_id: "", col_emp_name: label_avg_hours, col_emp_hours: round(avg_hours, 2)})
+    else:
+        rows.append({col_emp_id: "(no staff)", col_emp_name: "", col_emp_hours: ""})
+
+    return pd.DataFrame(rows)
+
+
+# ==== Streamlit pages ====
+
+def run_main_page(config: dict, lang: str):
     with st.sidebar:
         st.markdown(f"### ⚙️ {t('settings', lang)}")
+        default_mode = config.get("default_output_mode", DEFAULT_CONFIG["default_output_mode"])
+        mode_index = 0 if default_mode == "folder" else 1
         output_mode = st.radio(
             t("output_mode", lang),
             ("folder", "zip"),
+            index=mode_index,
             format_func=lambda x: t("output_mode_folder", lang) if x == "folder" else t("output_mode_zip", lang),
         )
 
+        default_folder = config.get("default_output_folder", DEFAULT_CONFIG["default_output_folder"])
         output_folder = None
         confirm_clear = False
         if output_mode == "folder":
-            output_folder = st.text_input(t("output_folder", lang), value="output")
+            output_folder = st.text_input(t("output_folder", lang), value=default_folder)
             if output_folder:
                 if os.path.exists(output_folder) and os.listdir(output_folder):
                     st.warning(t("folder_not_empty", lang).format(path=output_folder))
                     confirm_clear = st.checkbox(t("confirm_clear", lang))
 
-        ignore_list_input = st.text_input(t("ignore_list", lang), value=", ".join(DEFAULT_IGNORE_LIST))
+        ignore_list_cfg = config.get("ignore_project_types", DEFAULT_IGNORE_LIST)
+        st.markdown(f"### 🧾 {t('ignore_list', lang)}")
+        st.write(", ".join(ignore_list_cfg) if ignore_list_cfg else "—")
 
-    col1, col2, col3 = st.columns(3)
+    if not REPORTLAB_AVAILABLE:
+        st.warning(t("pdf_not_available", lang))
+
+    db_df = None
+    db_loaded_from_config = False
+    db_error_msg = None
+    db_config_path = config.get("database_path", DEFAULT_CONFIG["database_path"])
+    resolved_db_path = resolve_path_from_config(db_config_path) if db_config_path else ""
+
+    if resolved_db_path:
+        if os.path.exists(resolved_db_path):
+            try:
+                db_df = pd.read_excel(resolved_db_path)
+                db_loaded_from_config = True
+            except Exception as e:
+                db_error_msg = f"{t('db_config_error', lang)} {resolved_db_path}\n{e}"
+        else:
+            db_error_msg = f"{t('db_config_missing', lang)} {resolved_db_path}"
+
+    col1, col2 = st.columns(2)
     with col1:
         full_file = st.file_uploader(t("full_timesheet", lang), type=["xlsx"])
     with col2:
-        db_file = st.file_uploader(t("vendor_db", lang), type=["xlsx"])
-    with col3:
-        sample_file = st.file_uploader(t("sample_file", lang), type=["xlsx"])  # not used, just for reference
+        if db_loaded_from_config:
+            st.success(f"{t('db_loaded_from_config', lang)}\n{resolved_db_path}")
+            db_file = st.file_uploader(t("db_upload_optional", lang), type=["xlsx"])
+        else:
+            if db_error_msg:
+                st.warning(db_error_msg)
+            db_file = st.file_uploader(t("vendor_db", lang), type=["xlsx"])
 
-    # Determine if start button should be disabled
-    disable_start = full_file is None or db_file is None
+    if db_file is not None:
+        try:
+            db_df = pd.read_excel(db_file)
+            db_loaded_from_config = False
+            db_error_msg = None
+        except Exception as e:
+            st.error(f"Error reading uploaded Vendor DB: {e}")
+            db_df = None
+
+    disable_start = full_file is None or (db_df is None)
     if output_mode == "folder":
         if not output_folder:
             disable_start = True
@@ -730,32 +842,20 @@ def main():
         return
 
     try:
-        progress = st.progress(0.0, text=t("progress_init", lang))
-    except TypeError:
-        # Older Streamlit without text argument
-        progress = st.progress(0.0)
-        st.info(t("progress_init", lang))
+        try:
+            progress = st.progress(0.0, text=t("progress_init", lang))
+        except TypeError:
+            progress = st.progress(0.0)
+            st.info(t("progress_init", lang))
 
-    status_placeholder = st.empty()
+        status_placeholder = st.empty()
 
-    try:
-        # Read input files
         full_df = pd.read_excel(full_file)
-        db_df = pd.read_excel(db_file)
-
-        # Normalize column names (strip spaces)
         full_df.columns = full_df.columns.str.strip()
         db_df.columns = db_df.columns.str.strip()
 
-        # Parse ignore list from UI
-        ignore_list = [s.strip() for s in ignore_list_input.split(",") if s.strip()]
-        if not ignore_list:
-            ignore_list = DEFAULT_IGNORE_LIST
+        ignore_list = config.get("ignore_project_types", DEFAULT_IGNORE_LIST)
 
-        if not REPORTLAB_AVAILABLE:
-            st.warning(t("pdf_not_available", lang))
-
-        # Prepare in-memory employee data
         employees, ignored, unassigned, project_flagged, unique_emp_ids = prepare_employee_data(
             full_df, db_df, ignore_list
         )
@@ -764,15 +864,20 @@ def main():
         failed = []
         successful_employees = []
 
-        # Prepare output on disk if needed
         if output_mode == "folder":
-            if os.path.exists(output_folder):
-                # Clear folder if user confirmed
-                if os.listdir(output_folder):
-                    shutil.rmtree(output_folder)
-            os.makedirs(output_folder, exist_ok=True)
+            try:
+                if os.path.exists(output_folder):
+                    if os.listdir(output_folder):
+                        shutil.rmtree(output_folder)
+                os.makedirs(output_folder, exist_ok=True)
+            except Exception as e:
+                st.error(
+                    f"Could not clear or create output folder '{output_folder}'. "
+                    "Please close any open files (Excel/Explorer) that use this folder and check permissions. "
+                    f"Details: {e}"
+                )
+                return
 
-        # For ZIP mode, we'll build the archive in memory
         zip_buffer = io.BytesIO() if output_mode == "zip" else None
         if zip_buffer is not None:
             zip_file = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED)
@@ -787,10 +892,7 @@ def main():
             total_hours = emp["Total Hours"]
 
             try:
-                if total_to_process:
-                    progress_val = idx / total_to_process
-                else:
-                    progress_val = 1.0
+                progress_val = (idx / total_to_process) if total_to_process else 1.0
                 progress.progress(progress_val)
                 status_placeholder.write(
                     t("progress_emp", lang).format(idx=idx, total=total_to_process, emp_id=emp_id)
@@ -806,7 +908,6 @@ def main():
                     file_path = os.path.join(vendor_folder_path, safe_file_name)
                     emp_df.to_excel(file_path, index=False)
 
-                    # PDF generation (same filename, .pdf extension)
                     if REPORTLAB_AVAILABLE:
                         pdf_bytes = dataframe_to_pdf_bytes(emp_df, title=file_base_name)
                         pdf_path = (
@@ -817,15 +918,13 @@ def main():
                         with open(pdf_path, "wb") as pf:
                             pf.write(pdf_bytes)
 
-                else:  # zip
-                    # Write Excel to bytes & add to zip under vendor folder
+                else:
                     xls_buffer = io.BytesIO()
                     emp_df.to_excel(xls_buffer, index=False)
                     xls_buffer.seek(0)
                     arcname = f"{safe_vendor_folder}/{safe_file_name}"
                     zip_file.writestr(arcname, xls_buffer.getvalue())
 
-                    # PDF generation for ZIP
                     if REPORTLAB_AVAILABLE:
                         pdf_bytes = dataframe_to_pdf_bytes(emp_df, title=file_base_name)
                         if safe_file_name.lower().endswith(".xlsx"):
@@ -835,7 +934,6 @@ def main():
                         pdf_arcname = f"{safe_vendor_folder}/{pdf_name}"
                         zip_file.writestr(pdf_arcname, pdf_bytes)
 
-                # If we reached here, it is successful
                 successful_employees.append(
                     {
                         "Vendor": vendor,
@@ -845,7 +943,7 @@ def main():
                     }
                 )
 
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 failed.append(
                     {
                         "Vendor": vendor,
@@ -856,28 +954,21 @@ def main():
                     }
                 )
 
-        # Close ZIP if used
         if zip_file is not None:
             zip_file.close()
 
-        # Use successful_employees for summary of exported staff only
         employees_for_summary = []
         success_keys = {(e["Emp ID"], e["Vendor"]) for e in successful_employees}
         for emp in employees:
             if (emp["Emp ID"], emp["Vendor"]) in success_keys:
                 employees_for_summary.append(emp)
 
-        # Unassigned P* staff: keep only those that were actually exported
         unassigned_for_summary = [
             u for u in unassigned if (u["Emp ID"], u["Vendor"]) in success_keys
         ]
 
-        # 🚩 Project-ignored staff are by definition NOT exported,
-        # so we keep the full list for reporting:
         project_flagged_for_summary = project_flagged
 
-
-        # Build summary dataframes
         (
             summary_stats,
             vendor_summary_df,
@@ -896,7 +987,50 @@ def main():
             lang,
         )
 
-        # Build DOCX summary
+        vendor_to_emps = {}
+        for emp in employees_for_summary:
+            v = emp["Vendor"]
+            vendor_to_emps.setdefault(v, []).append(emp)
+
+        if output_mode == "folder":
+            for vendor, emps_list in vendor_to_emps.items():
+                safe_vendor_folder = safe_name(vendor)
+                vendor_folder_path = os.path.join(output_folder, safe_vendor_folder)
+                os.makedirs(vendor_folder_path, exist_ok=True)
+
+                vendor_summary_df_vendor = build_vendor_staff_summary_df(vendor, emps_list, lang)
+                base_name = safe_name(f"{vendor}-StaffSummary")
+
+                vendor_summary_xlsx_path = os.path.join(vendor_folder_path, base_name + ".xlsx")
+                vendor_summary_df_vendor.to_excel(vendor_summary_xlsx_path, index=False)
+
+                if REPORTLAB_AVAILABLE:
+                    pdf_bytes = dataframe_to_pdf_bytes(vendor_summary_df_vendor, title=f"{vendor} - Staff Summary")
+                    vendor_summary_pdf_path = os.path.join(vendor_folder_path, base_name + ".pdf")
+                    with open(vendor_summary_pdf_path, "wb") as pf:
+                        pf.write(pdf_bytes)
+
+        else:
+            if zip_buffer is not None:
+                with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file_append:
+                    for vendor, emps_list in vendor_to_emps.items():
+                        safe_vendor_folder = safe_name(vendor)
+                        vendor_summary_df_vendor = build_vendor_staff_summary_df(vendor, emps_list, lang)
+                        base_name = safe_name(f"{vendor}-StaffSummary")
+
+                        xls_buf = io.BytesIO()
+                        vendor_summary_df_vendor.to_excel(xls_buf, index=False)
+                        xls_buf.seek(0)
+                        arcname_xlsx = f"{safe_vendor_folder}/{base_name}.xlsx"
+                        zip_file_append.writestr(arcname_xlsx, xls_buf.getvalue())
+
+                        if REPORTLAB_AVAILABLE:
+                            pdf_bytes = dataframe_to_pdf_bytes(
+                                vendor_summary_df_vendor, title=f"{vendor} - Staff Summary"
+                            )
+                            arcname_pdf = f"{safe_vendor_folder}/{base_name}.pdf"
+                            zip_file_append.writestr(arcname_pdf, pdf_bytes)
+
         doc = build_docx_summary(
             summary_stats,
             vendor_summary_df,
@@ -911,13 +1045,11 @@ def main():
         doc.save(doc_buffer)
         doc_buffer.seek(0)
 
-        # Place DOCX summary in output
         if output_mode == "folder":
             summary_path = os.path.join(output_folder, SUMMARY_DOC_NAME)
             with open(summary_path, "wb") as f:
                 f.write(doc_buffer.getvalue())
         else:
-            # Add DOCX at root of ZIP
             zip_buffer.seek(0)
             with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file_append:
                 zip_file_append.writestr(SUMMARY_DOC_NAME, doc_buffer.getvalue())
@@ -927,7 +1059,6 @@ def main():
         status_placeholder.empty()
         st.success(t("done", lang))
 
-        # Show high-level metrics
         st.markdown(f"### 📊 {t('metrics_title', lang)}")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric(t("metric_total_emps", lang), summary_stats["total_emps"])
@@ -940,7 +1071,6 @@ def main():
             summary_stats["project_flagged_emps"],
         )
 
-        # Show run details
         st.markdown("----")
         c7, c8 = st.columns(2)
         c7.write(
@@ -948,7 +1078,6 @@ def main():
         )
         c8.write(f"**{t('period', lang)}:** {summary_stats['period']}")
 
-        # Show tables
         with st.expander("📦 " + t("vendor_summary_title", lang), expanded=True):
             if vendor_summary_df is not None and not vendor_summary_df.empty:
                 st.dataframe(vendor_summary_df, use_container_width=True)
@@ -985,7 +1114,6 @@ def main():
             else:
                 st.write(t("no_failed", lang))
 
-        # Download buttons
         col_dl1, col_dl2 = st.columns(2)
         with col_dl1:
             st.download_button(
@@ -1003,8 +1131,163 @@ def main():
                     mime="application/zip",
                 )
 
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         st.error(f"{t('fatal_error', lang)}: {e}")
+
+
+def run_settings_page(config: dict, lang: str):
+    st.markdown(f"## {t('config_title', lang)}")
+
+    if st.button("⬅️ Back"):
+        st.session_state["page"] = "main"
+        return
+
+    cfg = config.copy()
+
+    st.markdown(f"### 📁 {t('config_section_paths', lang)}")
+    db_path = st.text_input(
+        t("config_db_path", lang),
+        value=cfg.get("database_path", DEFAULT_CONFIG["database_path"]),
+    )
+    logo_path = st.text_input(
+        t("config_logo_path", lang),
+        value=cfg.get("logo_path", DEFAULT_CONFIG["logo_path"]),
+    )
+
+    if db_path:
+        resolved = resolve_path_from_config(db_path)
+        st.caption(f"{t('config_db_resolved', lang)}: {resolved}")
+    else:
+        resolved = ""
+
+    st.markdown(f"### 🎨 {t('config_section_branding', lang)}")
+    dept_name = st.text_input(
+        t("config_department_name", lang),
+        value=cfg.get("department_name", DEFAULT_CONFIG["department_name"]),
+    )
+    user_name = st.text_input(
+        t("config_user_name", lang),
+        value=cfg.get("user_name", DEFAULT_CONFIG["user_name"]),
+    )
+
+    st.markdown(f"**{t('config_logo_preview', lang)}:**")
+    logo_resolved = resolve_path_from_config(logo_path) if logo_path else ""
+    if logo_resolved and os.path.exists(logo_resolved):
+        st.image(logo_resolved, width=150)
+    else:
+        st.caption("No logo found at current path.")
+
+    st.markdown(f"### 📤 {t('config_section_output', lang)}")
+    default_mode = cfg.get("default_output_mode", DEFAULT_CONFIG["default_output_mode"])
+    mode_index = 0 if default_mode == "folder" else 1
+    out_mode = st.radio(
+        t("config_default_output_mode", lang),
+        ("folder", "zip"),
+        index=mode_index,
+        format_func=lambda x: t("output_mode_folder", lang) if x == "folder" else t("output_mode_zip", lang),
+    )
+    out_folder = st.text_input(
+        t("config_default_output_folder", lang),
+        value=cfg.get("default_output_folder", DEFAULT_CONFIG["default_output_folder"]),
+    )
+
+    st.markdown(f"### 🚫 {t('config_section_ignore', lang)}")
+    ignore_list = cfg.get("ignore_project_types", DEFAULT_IGNORE_LIST)
+    ignore_df = pd.DataFrame({"Project Type": ignore_list})
+    edited_ignore_df = st.data_editor(
+        ignore_df,
+        num_rows="dynamic",
+        key="ignore_editor",
+    )
+
+    if st.button(t("config_save_button", lang)):
+        new_cfg = cfg.copy()
+        new_cfg["database_path"] = db_path.strip() or DEFAULT_CONFIG["database_path"]
+        new_cfg["logo_path"] = logo_path.strip() or DEFAULT_CONFIG["logo_path"]
+        new_cfg["department_name"] = dept_name.strip() or DEFAULT_CONFIG["department_name"]
+        new_cfg["user_name"] = user_name.strip() or DEFAULT_CONFIG["user_name"]
+        new_cfg["default_output_mode"] = out_mode
+        new_cfg["default_output_folder"] = out_folder.strip() or DEFAULT_CONFIG["default_output_folder"]
+
+        try:
+            new_ignore_list = [
+                str(v).strip()
+                for v in edited_ignore_df["Project Type"].tolist()
+                if str(v).strip()
+            ]
+        except Exception:
+            new_ignore_list = DEFAULT_IGNORE_LIST
+        if not new_ignore_list:
+            new_ignore_list = DEFAULT_IGNORE_LIST
+        new_cfg["ignore_project_types"] = new_ignore_list
+
+        save_app_config(new_cfg)
+        st.success(t("config_saved", lang))
+
+
+def main():
+    st.set_page_config(page_title="Timesheet Splitter", page_icon="⏱️", layout="wide")
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+    config = load_app_config()
+
+    # Initialize language from config
+    if "lang" not in st.session_state:
+        cfg_lang = config.get("language", DEFAULT_CONFIG["language"])
+        if isinstance(cfg_lang, str) and "ar" in cfg_lang.lower():
+            st.session_state["lang"] = "ar"
+        else:
+            st.session_state["lang"] = "en"
+
+    if "page" not in st.session_state:
+        st.session_state["page"] = "main"
+
+    with st.sidebar:
+        lang_choice = st.radio(
+            t("sidebar_lang", st.session_state["lang"]),
+            ("en", "ar"),
+            index=0 if st.session_state["lang"] == "en" else 1,
+            format_func=lambda x: t(f"ui_language_{x}", st.session_state["lang"]),
+        )
+        if lang_choice != st.session_state["lang"]:
+            st.session_state["lang"] = lang_choice
+            config["language"] = "Arabic" if lang_choice == "ar" else "English"
+            save_app_config(config)
+
+    lang = st.session_state["lang"]
+
+    logo_path_cfg = config.get("logo_path", DEFAULT_CONFIG["logo_path"])
+    logo_full_path = resolve_path_from_config(logo_path_cfg) if logo_path_cfg else ""
+    dept = config.get("department_name", DEFAULT_CONFIG["department_name"])
+    user_name = config.get("user_name", DEFAULT_CONFIG["user_name"])
+
+    col_logo, col_title, col_gear = st.columns([1, 4, 0.7])
+    with col_logo:
+        if logo_full_path and os.path.exists(logo_full_path):
+            st.image(logo_full_path, use_container_width=True)
+        else:
+            st.write("")
+    with col_title:
+        st.markdown(f"<h1 class='app-title'>⏱️ {t('title', lang)}</h1>", unsafe_allow_html=True)
+        st.markdown(f"<p class='app-subtitle'>{t('subtitle', lang)}</p>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='brand-line'><strong>Department:</strong> {dept} &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"<strong>User:</strong> {user_name}</div>",
+            unsafe_allow_html=True,
+        )
+        if st.session_state["page"] == "main":
+            st.markdown(
+                f"<div class='welcome-line'>👋 Welcome, {user_name}</div>",
+                unsafe_allow_html=True,
+            )
+    with col_gear:
+        if st.button("⚙️", help="Open settings"):
+            st.session_state["page"] = "settings"
+
+    if st.session_state["page"] == "main":
+        run_main_page(config, lang)
+    else:
+        run_settings_page(config, lang)
 
 
 if __name__ == "__main__":

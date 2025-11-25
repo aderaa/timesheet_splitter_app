@@ -1,0 +1,6 @@
+# Ignore output folder
+output/
+
+
+# Ignore config file
+# app.config
