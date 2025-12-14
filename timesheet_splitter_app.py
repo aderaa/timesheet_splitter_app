@@ -14,9 +14,10 @@ import streamlit as st
 # Try to import reportlab for PDF generation
 try:
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.pagesizes import A4, A1, landscape
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+    from reportlab.pdfbase import pdfmetrics
 
     REPORTLAB_AVAILABLE = True
 except ImportError:
@@ -346,13 +347,18 @@ def resolve_path_from_config(path_value: str) -> str:
 
 
 def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
-    """Render a pandas DataFrame to a table PDF, word-wrapped and fitted to landscape A4 width."""
+    """
+    Render a pandas DataFrame to a table PDF:
+    - Use large landscape A1 page to maximize width
+    - Compute column widths from text width to avoid wrapping as much as possible
+    """
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("reportlab is not installed")
 
     buffer = io.BytesIO()
 
-    page_size = landscape(A4)
+    # Large page: A1 landscape
+    page_size = landscape(A1)
     page_width, page_height = page_size
     left_margin = right_margin = top_margin = bottom_margin = 20
 
@@ -368,19 +374,26 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
     elements = []
     styles = getSampleStyleSheet()
 
+    header_font_name = "Helvetica"
+    body_font_name = "Helvetica"
+    header_font_size = 8
+    body_font_size = 7
+
     header_style = ParagraphStyle(
         "HeaderCell",
         parent=styles["Normal"],
-        fontSize=8,
-        leading=10,
+        fontName=header_font_name,
+        fontSize=header_font_size,
+        leading=header_font_size + 2,
         alignment=1,  # center
     )
     cell_style = ParagraphStyle(
         "TableCell",
         parent=styles["Normal"],
-        fontSize=7,
-        leading=9,
-        wordWrap="CJK",
+        fontName=body_font_name,
+        fontSize=body_font_size,
+        leading=body_font_size + 2,
+        wordWrap="CJK",  # safe wrapping if needed
     )
 
     if title:
@@ -390,19 +403,37 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
         df = pd.DataFrame({"": ["(no data)"]})
 
     df_str = df.astype(str)
+    cols = list(df_str.columns)
+    ncols = len(cols) or 1
 
-    header_row = [Paragraph(str(col), header_style) for col in df_str.columns]
+    # ---- Compute column widths based on text width (header + data) ----
+    col_widths_pts = []
+    for col in cols:
+        max_w = pdfmetrics.stringWidth(str(col), header_font_name, header_font_size)
+        for val in df_str[col].values:
+            txt = str(val)
+            w = pdfmetrics.stringWidth(txt, body_font_name, body_font_size)
+            if w > max_w:
+                max_w = w
+        col_widths_pts.append(max_w + 6)  # padding
+
+    avail_width = page_width - left_margin - right_margin
+    total_width = sum(col_widths_pts) if col_widths_pts else avail_width
+
+    # If total width > available, scale all columns proportionally to fit
+    if total_width > avail_width and total_width > 0:
+        scale = avail_width / total_width
+        col_widths_pts = [w * scale for w in col_widths_pts]
+
+    # ---- Build table data ----
+    header_row = [Paragraph(str(col), header_style) for col in cols]
     data_rows = []
     for _, row in df_str.iterrows():
         data_rows.append([Paragraph(str(val), cell_style) for val in row])
 
     data = [header_row] + data_rows
 
-    ncols = len(df_str.columns) or 1
-    avail_width = page_width - left_margin - right_margin
-    col_widths = [avail_width / ncols] * ncols
-
-    table = Table(data, colWidths=col_widths, repeatRows=1)
+    table = Table(data, colWidths=col_widths_pts, repeatRows=1)
 
     style = TableStyle(
         [
@@ -410,7 +441,7 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
             ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("FONTSIZE", (0, 0), (-1, 0), header_font_size),
             ("ALIGN", (0, 0), (-1, 0), "CENTER"),
             ("ALIGN", (0, 1), (-1, -1), "CENTER"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -422,6 +453,28 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
     doc.build(elements)
     buffer.seek(0)
     return buffer.getvalue()
+
+
+def auto_fit_excel_columns(writer, sheet_name: str):
+    """Auto-fit column widths for an Excel sheet created with openpyxl."""
+    try:
+        ws = writer.sheets[sheet_name]
+    except KeyError:
+        return
+
+    for column_cells in ws.columns:
+        max_length = 0
+        col = column_cells[0].column_letter
+        for cell in column_cells:
+            try:
+                cell_val = "" if cell.value is None else str(cell.value)
+            except Exception:
+                cell_val = ""
+            if len(cell_val) > max_length:
+                max_length = len(cell_val)
+        # A small padding
+        adjusted_width = max_length + 2
+        ws.column_dimensions[col].width = adjusted_width
 
 
 def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_list):
@@ -813,12 +866,12 @@ def run_main_page(config: dict, lang: str):
         full_file = st.file_uploader(t("full_timesheet", lang), type=["xlsx"])
     with col2:
         if db_loaded_from_config:
-            # Small visual hint only: label + ✅, no big success box
+            # Small label with check mark, no big success box
             label = f"{t('vendor_db', lang)} ✅"
             db_file = st.file_uploader(
                 label,
                 type=["xlsx"],
-                help=t("db_upload_optional", lang),  # optional override
+                help=t("db_upload_optional", lang),
             )
         else:
             if db_error_msg:
@@ -911,8 +964,13 @@ def run_main_page(config: dict, lang: str):
                     vendor_folder_path = os.path.join(output_folder, safe_vendor_folder)
                     os.makedirs(vendor_folder_path, exist_ok=True)
                     file_path = os.path.join(vendor_folder_path, safe_file_name)
-                    emp_df.to_excel(file_path, index=False)
 
+                    # Excel with auto-fit columns
+                    with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
+                        emp_df.to_excel(writer, index=False, sheet_name="Timesheet")
+                        auto_fit_excel_columns(writer, "Timesheet")
+
+                    # PDF (A1 landscape, wide columns)
                     if REPORTLAB_AVAILABLE:
                         pdf_bytes = dataframe_to_pdf_bytes(emp_df, title=file_base_name)
                         pdf_path = (
@@ -924,12 +982,16 @@ def run_main_page(config: dict, lang: str):
                             pf.write(pdf_bytes)
 
                 else:
+                    # Excel to ZIP with auto-fit
                     xls_buffer = io.BytesIO()
-                    emp_df.to_excel(xls_buffer, index=False)
+                    with pd.ExcelWriter(xls_buffer, engine="openpyxl") as writer:
+                        emp_df.to_excel(writer, index=False, sheet_name="Timesheet")
+                        auto_fit_excel_columns(writer, "Timesheet")
                     xls_buffer.seek(0)
                     arcname = f"{safe_vendor_folder}/{safe_file_name}"
                     zip_file.writestr(arcname, xls_buffer.getvalue())
 
+                    # PDF inside ZIP
                     if REPORTLAB_AVAILABLE:
                         pdf_bytes = dataframe_to_pdf_bytes(emp_df, title=file_base_name)
                         if safe_file_name.lower().endswith(".xlsx"):
@@ -1006,11 +1068,17 @@ def run_main_page(config: dict, lang: str):
                 vendor_summary_df_vendor = build_vendor_staff_summary_df(vendor, emps_list, lang)
                 base_name = safe_name(f"{vendor}-StaffSummary")
 
+                # Excel per vendor with auto-fit
                 vendor_summary_xlsx_path = os.path.join(vendor_folder_path, base_name + ".xlsx")
-                vendor_summary_df_vendor.to_excel(vendor_summary_xlsx_path, index=False)
+                with pd.ExcelWriter(vendor_summary_xlsx_path, engine="openpyxl") as writer:
+                    vendor_summary_df_vendor.to_excel(writer, index=False, sheet_name="Summary")
+                    auto_fit_excel_columns(writer, "Summary")
 
+                # PDF per vendor
                 if REPORTLAB_AVAILABLE:
-                    pdf_bytes = dataframe_to_pdf_bytes(vendor_summary_df_vendor, title=f"{vendor} - Staff Summary")
+                    pdf_bytes = dataframe_to_pdf_bytes(
+                        vendor_summary_df_vendor, title=f"{vendor} - Staff Summary"
+                    )
                     vendor_summary_pdf_path = os.path.join(vendor_folder_path, base_name + ".pdf")
                     with open(vendor_summary_pdf_path, "wb") as pf:
                         pf.write(pdf_bytes)
@@ -1023,12 +1091,16 @@ def run_main_page(config: dict, lang: str):
                         vendor_summary_df_vendor = build_vendor_staff_summary_df(vendor, emps_list, lang)
                         base_name = safe_name(f"{vendor}-StaffSummary")
 
+                        # Excel per vendor in ZIP
                         xls_buf = io.BytesIO()
-                        vendor_summary_df_vendor.to_excel(xls_buf, index=False)
+                        with pd.ExcelWriter(xls_buf, engine="openpyxl") as writer:
+                            vendor_summary_df_vendor.to_excel(writer, index=False, sheet_name="Summary")
+                            auto_fit_excel_columns(writer, "Summary")
                         xls_buf.seek(0)
                         arcname_xlsx = f"{safe_vendor_folder}/{base_name}.xlsx"
                         zip_file_append.writestr(arcname_xlsx, xls_buf.getvalue())
 
+                        # PDF per vendor in ZIP
                         if REPORTLAB_AVAILABLE:
                             pdf_bytes = dataframe_to_pdf_bytes(
                                 vendor_summary_df_vendor, title=f"{vendor} - Staff Summary"
@@ -1236,7 +1308,6 @@ def main():
 
     config = load_app_config()
 
-    # Initialize language from config
     if "lang" not in st.session_state:
         cfg_lang = config.get("language", DEFAULT_CONFIG["language"])
         if isinstance(cfg_lang, str) and "ar" in cfg_lang.lower():
