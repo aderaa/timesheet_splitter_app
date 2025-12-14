@@ -23,6 +23,9 @@ try:
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table as XLTable, TableStyleInfo
+
 
 # ==== Paths & Config ====
 
@@ -349,9 +352,10 @@ def resolve_path_from_config(path_value: str) -> str:
 def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
     """
     Render a pandas DataFrame to a table PDF:
-    - Use large landscape A1 page to maximize width
-    - Compute column widths from text width
-    - DISABLE word wrapping completely (no broken headers/emails)
+    - A1 landscape page (very wide)
+    - Column widths based on text width
+    - Blue header, gray banded rows
+    - NO word wrapping (plain strings, not Paragraphs)
     """
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("reportlab is not installed")
@@ -375,28 +379,10 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
     elements = []
     styles = getSampleStyleSheet()
 
-    header_font_name = "Helvetica"
+    header_font_name = "Helvetica-Bold"
     body_font_name = "Helvetica"
     header_font_size = 8
     body_font_size = 7
-
-    header_style = ParagraphStyle(
-        "HeaderCell",
-        parent=styles["Normal"],
-        fontName=header_font_name,
-        fontSize=header_font_size,
-        leading=header_font_size + 2,
-        alignment=1,  # center
-    )
-    cell_style = ParagraphStyle(
-        "TableCell",
-        parent=styles["Normal"],
-        fontName=body_font_name,
-        fontSize=body_font_size,
-        leading=body_font_size + 2,
-        wordWrap="None",     # 🔴 no wrapping
-        splitLongWords=0,    # 🔴 don't break long words like emails
-    )
 
     if title:
         elements.append(Paragraph(title, styles["Heading2"]))
@@ -404,48 +390,64 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
     if df is None or df.empty:
         df = pd.DataFrame({"": ["(no data)"]})
 
+    # Everything as string
     df_str = df.astype(str)
     cols = list(df_str.columns)
-    ncols = len(cols) or 1
 
-    # ---- Compute column widths purely from text width (header + data) ----
+    # ---- Compute column widths purely from text width ----
     col_widths_pts = []
     for col in cols:
+        # header width
         max_w = pdfmetrics.stringWidth(str(col), header_font_name, header_font_size)
+        # data width
         for val in df_str[col].values:
             txt = str(val)
             w = pdfmetrics.stringWidth(txt, body_font_name, body_font_size)
             if w > max_w:
                 max_w = w
-        # add small padding
-        col_widths_pts.append(max_w + 8)
+        col_widths_pts.append(max_w + 8)  # small padding
 
-    # ❌ IMPORTANT: no scaling back to page width.
-    # If the table is wider than the page, content might overflow horizontally,
-    # but it will NOT wrap text in cells.
+    # ❌ no scaling back to page width – if it’s wider, it just overflows horizontally
 
-    # ---- Build table data ----
-    header_row = [Paragraph(str(col), header_style) for col in cols]
+    # ---- Build table data (plain strings, no Paragraphs => no wrapping) ----
+    header_row = [str(col) for col in cols]
     data_rows = []
     for _, row in df_str.iterrows():
-        data_rows.append([Paragraph(str(val), cell_style) for val in row])
+        data_rows.append([str(val) for val in row])
 
     data = [header_row] + data_rows
 
     table = Table(data, colWidths=col_widths_pts, repeatRows=1)
 
+    # Blue header, gray banded rows (Excel-like)
+    header_blue = colors.HexColor("#4472C4")      # Excel blue
+    band_gray = colors.HexColor("#D9D9D9")
+
     style = TableStyle(
         [
-            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+            ("BACKGROUND", (0, 0), (-1, 0), header_blue),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+
+            ("FONTNAME", (0, 0), (-1, 0), header_font_name),
             ("FONTSIZE", (0, 0), (-1, 0), header_font_size),
+
+            ("FONTNAME", (0, 1), (-1, -1), body_font_name),
+            ("FONTSIZE", (0, 1), (-1, -1), body_font_size),
+
             ("ALIGN", (0, 0), (-1, 0), "CENTER"),
             ("ALIGN", (0, 1), (-1, -1), "CENTER"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ]
     )
+    # gray banded rows for data (starting from row 1 = first data row)
+    style.add(
+        "ROWBACKGROUNDS",
+        (0, 1),
+        (-1, -1),
+        [colors.whitesmoke, band_gray],
+    )
+
     table.setStyle(style)
 
     elements.append(table)
@@ -455,12 +457,13 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
 
 
 def auto_fit_excel_columns(writer, sheet_name: str):
-    """Auto-fit column widths for an Excel sheet created with openpyxl."""
+    """Auto-fit column widths AND convert the data range to an Excel Table."""
     try:
         ws = writer.sheets[sheet_name]
     except KeyError:
         return
 
+    # --- Auto-fit column widths ---
     for column_cells in ws.columns:
         max_length = 0
         col = column_cells[0].column_letter
@@ -471,10 +474,40 @@ def auto_fit_excel_columns(writer, sheet_name: str):
                 cell_val = ""
             if len(cell_val) > max_length:
                 max_length = len(cell_val)
-        # A small padding
         adjusted_width = max_length + 2
         ws.column_dimensions[col].width = adjusted_width
 
+    # --- Convert used range to a styled Excel Table ---
+    try:
+        if ws.max_row < 1 or ws.max_column < 1:
+            return
+
+        first_col = get_column_letter(1)
+        last_col = get_column_letter(ws.max_column)
+        ref = f"{first_col}1:{last_col}{ws.max_row}"
+
+        # Build a safe, unique table name based on the sheet name
+        base_name = re.sub(r"\W+", "_", sheet_name) or "Table"
+        existing = {tbl.displayName for tbl in ws._tables}
+        name = base_name
+        idx = 1
+        while name in existing:
+            idx += 1
+            name = f"{base_name}_{idx}"
+
+        table = XLTable(displayName=name, ref=ref)
+        style = TableStyleInfo(
+            name="TableStyleMedium9",   # blue header + banded rows
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        table.tableStyleInfo = style
+        ws.add_table(table)
+    except Exception:
+        # best-effort; if something fails, we still keep the data
+        pass
 
 def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_list):
     """
