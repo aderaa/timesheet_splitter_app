@@ -350,7 +350,8 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
     """
     Render a pandas DataFrame to a table PDF:
     - Use large landscape A1 page to maximize width
-    - Compute column widths from text width to avoid wrapping as much as possible
+    - Compute column widths from text width
+    - DISABLE word wrapping completely (no broken headers/emails)
     """
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("reportlab is not installed")
@@ -393,7 +394,8 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
         fontName=body_font_name,
         fontSize=body_font_size,
         leading=body_font_size + 2,
-        wordWrap="CJK",  # safe wrapping if needed
+        wordWrap="None",     # 🔴 no wrapping
+        splitLongWords=0,    # 🔴 don't break long words like emails
     )
 
     if title:
@@ -406,7 +408,7 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
     cols = list(df_str.columns)
     ncols = len(cols) or 1
 
-    # ---- Compute column widths based on text width (header + data) ----
+    # ---- Compute column widths purely from text width (header + data) ----
     col_widths_pts = []
     for col in cols:
         max_w = pdfmetrics.stringWidth(str(col), header_font_name, header_font_size)
@@ -415,15 +417,12 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
             w = pdfmetrics.stringWidth(txt, body_font_name, body_font_size)
             if w > max_w:
                 max_w = w
-        col_widths_pts.append(max_w + 6)  # padding
+        # add small padding
+        col_widths_pts.append(max_w + 8)
 
-    avail_width = page_width - left_margin - right_margin
-    total_width = sum(col_widths_pts) if col_widths_pts else avail_width
-
-    # If total width > available, scale all columns proportionally to fit
-    if total_width > avail_width and total_width > 0:
-        scale = avail_width / total_width
-        col_widths_pts = [w * scale for w in col_widths_pts]
+    # ❌ IMPORTANT: no scaling back to page width.
+    # If the table is wider than the page, content might overflow horizontally,
+    # but it will NOT wrap text in cells.
 
     # ---- Build table data ----
     header_row = [Paragraph(str(col), header_style) for col in cols]
