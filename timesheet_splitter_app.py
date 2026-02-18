@@ -4,18 +4,23 @@ import re
 import shutil
 import zipfile
 import json
-from datetime import datetime
+import time
+from datetime import datetime, date
 
 import pandas as pd
 from docx import Document
 
 import streamlit as st
 
-# Try to import reportlab for PDF generation
+# Email
+import smtplib
+from email.message import EmailMessage
+
+# PDF
 try:
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4, A1, landscape
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.pagesizes import A1, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
     from reportlab.pdfbase import pdfmetrics
 
@@ -23,6 +28,7 @@ try:
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
+# Excel table styling
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table as XLTable, TableStyleInfo
 
@@ -37,34 +43,39 @@ FULL_EMP_ID_COL = "EMP ID"
 FULL_EMP_NAME_COL = "User Name"
 FULL_DATE_COL = "Date"
 FULL_HOURS_COL = "Regular Time (Hours)"
-FULL_PROJECT_TYPE_COL = "Project Type"  # column used for ignore list (e.g. "On Bench")
+FULL_PROJECT_TYPE_COL = "Project Type"
 
-# Columns in "3.Databse.xlsx" / database file
+# Columns in "3.Databse.xlsx"
 DB_EMP_ID_COL = "Emp ID"
 DB_EMP_NAME_COL = "Employee Name"
 DB_VENDOR_COL = "Organization"
 
 SUMMARY_DOC_NAME = "Timesheet_Split_Summary.docx"
-
-# Default vendor for P* employees not in DB
 DEFAULT_VENDOR_NAME = "UnAssigned Vendor"
-
-# Default ignore list for Project Type
 DEFAULT_IGNORE_LIST = ["On Bench"]
 
 DEFAULT_CONFIG = {
-    "database_path": "Database.xlsx",          # relative to app root
+    "database_path": "Database.xlsx",
     "ignore_project_types": DEFAULT_IGNORE_LIST,
-    "logo_path": "malomatia-logo.png",         # relative to app root
+    "logo_path": "malomatia-logo.png",
     "department_name": "Digital Services",
     "user_name": "Malomatian",
-    "default_output_mode": "folder",           # "folder" or "zip"
+    "default_output_mode": "folder",  # folder or zip
     "default_output_folder": "output",
-    "language": "English",                     # persisted language preference
+    "language": "English",
+    # NEW: output file prefix
+    "output_file_prefix": "mal_DS_EXT_",    
+    # Email / SMTP
+    "email_smtp_server": "smtp.office365.com",
+    "email_smtp_port": 587,
+    "email_username": "",
+    "email_password": "",
+    "email_max_attachment_mb": 25,
+    "email_delay_seconds": 2,
+    "vendor_emails": {},  # {vendor: email}
 }
 
-
-# ==== Simple i18n helper ====
+# ==== i18n ====
 
 TEXT = {
     "en": {
@@ -138,7 +149,7 @@ TEXT = {
         "ui_language_en": "English",
         "ui_language_ar": "العربية",
         "ignore_list": "Ignored Project Types (from config)",
-        "pdf_not_available": "PDF generation library (reportlab) is not installed. Only Excel files will be generated. Please run: pip install reportlab",
+        "pdf_not_available": "PDF library (reportlab) is not installed. Only Excel files will be generated. Install with: pip install reportlab",
         "vendor_staff_header_emp_count": "Employees count",
         "vendor_staff_header_total_hours": "Total hours",
         "vendor_staff_header_avg_hours": "Average hours per employee",
@@ -164,6 +175,36 @@ TEXT = {
         "db_config_error": "Error reading DB file from configured path:",
         "db_upload_optional": "Override Vendor / Employee Database (optional)",
         "sidebar_lang": "Language / اللغة",
+        # Email settings
+        "config_email_section": "Email (SMTP) Settings",
+        "config_email_server": "SMTP server (e.g. smtp.office365.com)",
+        "config_email_port": "SMTP port",
+        "config_email_username": "SMTP username / email address",
+        "config_email_password": "SMTP password / app password",
+        "config_email_max_mb": "Max attachment size per email (MB)",
+        "config_email_delay": "Delay between emails (seconds)",
+        "config_vendor_emails": "Default vendor email addresses",
+        # Email UI
+        "email_section_title": "Email timesheets to vendors",
+        "email_requires_folder": "Emailing currently requires 'folder' output mode. Please rerun the split with folder output mode to enable emailing.",
+        "email_vendors_label": "Select vendors to email",
+        "email_vendor_address": "Vendor email address",
+        "email_emps_label": "Select employees (PDFs) to include for this vendor",
+        "email_start_button": "📧 Start sending emails",
+        "email_missing_smtp": "Email (SMTP) settings are incomplete. Please configure them in the Settings page.",
+        "email_progress_vendor": "Sending emails for vendor {current}/{total}: {vendor}",
+        "email_summary_title": "Email sending summary",
+        "email_no_vendor_email": "No email address configured for these vendors:",
+        "email_no_pdfs": "No PDFs found to attach for these vendors:",
+        "email_completed": "Email sending completed.",
+        "email_error_sending": "Error while sending emails",
+        "email_sent_row_vendor": "Vendor",
+        "email_sent_row_email": "Recipient email",
+        "email_sent_row_emps": "Employees attached",
+        "email_sent_row_zips": "ZIPs sent",
+        "email_sent_row_subjects": "Subjects",
+        "config_output_prefix": "mal_DS_EXT_",
+
     },
     "ar": {
         "title": "أداة تقسيم الجداول الزمنية للموظفين الخارجيين",
@@ -193,9 +234,9 @@ TEXT = {
         "metric_project_flagged_emps": "موظفون لديهم نوع مشروع من قائمة التجاهل",
         "vendor_summary_title": "ساعات العمل لكل مورد",
         "exported_table_title": "الموظفون الذين تم تصديرهم",
-        "ignored_table_title": "الموظفون المتجاهَلون (غير موجودين بقاعدة البيانات ولا يبدأ رقمهم بـ P)",
+        "ignored_table_title": "الموظفون المتجاهَلون (غير موجودين في قاعدة بيانات الموردين ولا يبدأ رقمهم بـ P)",
         "failed_table_title": "المحاولات الفاشلة",
-        "unassigned_table_title": "الموظفون الذين يبدأ رقمهم بـ P وغير موجودين بقاعدة البيانات (المورد الافتراضي)",
+        "unassigned_table_title": "الموظفون الذين يبدأ رقمهم بـ P وغير موجودين في قاعدة بيانات الموردين (المورد الافتراضي)",
         "project_ignored_table_title": "الموظفون الذين لديهم أنواع مشروع ضمن قائمة التجاهل (لا يتم تصديرهم)",
         "no_failed": "لا توجد محاولات فاشلة 🎉",
         "no_ignored": "لا يوجد موظفون متجاهَلون 🎉",
@@ -246,7 +287,7 @@ TEXT = {
         "config_section_paths": "المسارات والملفات",
         "config_db_path": "مسار ملف قاعدة بيانات الموردين / الموظفين (نسبي من مجلد التطبيق أو مطلق)",
         "config_logo_path": "مسار شعار الجهة (نسبي من مجلد التطبيق أو مطلق)",
-        "config_section_branding": "الهوية (Branding)",
+        "config_section_branding": "الهوية",
         "config_department_name": "اسم الإدارة / القسم",
         "config_user_name": "اسم المستخدم الافتراضي",
         "config_section_output": "إعدادات الإخراج الافتراضية",
@@ -258,20 +299,49 @@ TEXT = {
         "config_logo_preview": "معاينة الشعار",
         "config_db_resolved": "المسار الفعلي لملف قاعدة البيانات",
         "db_loaded_from_config": "تم تحميل ملف قاعدة بيانات الموردين من مسار الإعدادات:",
-        "db_config_missing": "لم يتم العثور على ملف قاعدة بيانات الموردين في المسار التالي:",
+        "db_config_missing": "لم يتم العثور على ملف قاعدة البيانات في المسار:",
         "db_config_error": "خطأ أثناء قراءة ملف قاعدة البيانات من المسار المحدد:",
         "db_upload_optional": "رفع ملف قاعدة بيانات بديل (اختياري)",
         "sidebar_lang": "Language / اللغة",
+        # Email settings
+        "config_email_section": "إعدادات البريد الإلكتروني (SMTP)",
+        "config_email_server": "خادم SMTP (مثال: smtp.office365.com)",
+        "config_email_port": "منفذ SMTP",
+        "config_email_username": "اسم مستخدم SMTP / عنوان البريد",
+        "config_email_password": "كلمة مرور SMTP / كلمة مرور التطبيق",
+        "config_email_max_mb": "أقصى حجم للمرفقات في البريد الواحد (ميجابايت)",
+        "config_email_delay": "الفاصل الزمني بين الرسائل (ثوانٍ)",
+        "config_vendor_emails": "عناوين البريد الإلكتروني الافتراضية للموردين",
+        # Email UI
+        "email_section_title": "إرسال الجداول الزمنية إلى الموردين عبر البريد الإلكتروني",
+        "email_requires_folder": "إرسال البريد متاح فقط عند اختيار وضع الإخراج 'مجلد'. يرجى إعادة التشغيل باستخدام وضع المجلد.",
+        "email_vendors_label": "اختر الموردين المراد إرسال بريد لهم",
+        "email_vendor_address": "عنوان البريد الإلكتروني للمورد",
+        "email_emps_label": "اختر الموظفين (ملفات PDF) المراد تضمينها لهذا المورد",
+        "email_start_button": "📧 بدء إرسال الرسائل",
+        "email_missing_smtp": "إعدادات البريد (SMTP) غير مكتملة. يرجى ضبطها من صفحة الإعدادات.",
+        "email_progress_vendor": "جارٍ إرسال الرسائل للمورد {current} من {total}: {vendor}",
+        "email_summary_title": "ملخص إرسال البريد",
+        "email_no_vendor_email": "لا يوجد عنوان بريد إلكتروني مضبوط للموردين التاليين:",
+        "email_no_pdfs": "لم يتم العثور على ملفات PDF للموردين التاليين:",
+        "email_completed": "تم الانتهاء من إرسال الرسائل.",
+        "email_error_sending": "حدث خطأ أثناء إرسال الرسائل",
+        "email_sent_row_vendor": "المورد",
+        "email_sent_row_email": "البريد المرسَل إليه",
+        "email_sent_row_emps": "عدد الموظفين ضمن المرفقات",
+        "email_sent_row_zips": "عدد ملفات ZIP المرسلة",
+        "email_sent_row_subjects": "عناوين الرسائل",
+        "config_output_prefix": "mal_DS_EXT_",        
     },
 }
 
 
 def t(key: str, lang: str) -> str:
-    """Translation helper."""
     return TEXT.get(lang, TEXT["en"]).get(key, TEXT["en"].get(key, key))
 
 
 # ==== Styling ====
+
 CUSTOM_CSS = """
 <style>
 .app-title {
@@ -293,13 +363,6 @@ CUSTOM_CSS = """
 .welcome-line {
     color: #2c3e50;
     font-size: 1.1rem;
-    margin-bottom: 1.2rem;
-}
-.summary-card {
-    padding: 0.9rem 1.2rem;
-    border-radius: 12px;
-    background: linear-gradient(135deg, #1abc9c, #3498db);
-    color: white;
     margin-bottom: 1.2rem;
 }
 </style>
@@ -332,7 +395,6 @@ def save_app_config(cfg: dict) -> None:
 # ==== Core helpers ====
 
 def safe_name(name: str) -> str:
-    """Make a string safe for use as a Windows file/folder name."""
     if pd.isna(name):
         name = "Unknown"
     name = str(name)
@@ -340,7 +402,6 @@ def safe_name(name: str) -> str:
 
 
 def resolve_path_from_config(path_value: str) -> str:
-    """Resolve a path from config: absolute or relative to APP_ROOT."""
     if not path_value:
         return ""
     path_value = str(path_value)
@@ -351,20 +412,18 @@ def resolve_path_from_config(path_value: str) -> str:
 
 def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
     """
-    Render a pandas DataFrame to a table PDF:
-    - A1 landscape page (very wide)
-    - Column widths based on text width
-    - Blue header, gray banded rows
-    - NO word wrapping (plain strings, not Paragraphs)
+    PDF:
+    - A1 landscape
+    - column widths based on text width
+    - blue header, gray banded rows
+    - NO wrapping (plain strings)
     """
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("reportlab is not installed")
 
     buffer = io.BytesIO()
 
-    # Large page: A1 landscape
     page_size = landscape(A1)
-    page_width, page_height = page_size
     left_margin = right_margin = top_margin = bottom_margin = 20
 
     doc = SimpleDocTemplate(
@@ -390,37 +449,28 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
     if df is None or df.empty:
         df = pd.DataFrame({"": ["(no data)"]})
 
-    # Everything as string
     df_str = df.astype(str)
     cols = list(df_str.columns)
 
-    # ---- Compute column widths purely from text width ----
     col_widths_pts = []
     for col in cols:
-        # header width
         max_w = pdfmetrics.stringWidth(str(col), header_font_name, header_font_size)
-        # data width
         for val in df_str[col].values:
             txt = str(val)
             w = pdfmetrics.stringWidth(txt, body_font_name, body_font_size)
             if w > max_w:
                 max_w = w
-        col_widths_pts.append(max_w + 8)  # small padding
+        col_widths_pts.append(max_w + 8)
 
-    # ❌ no scaling back to page width – if it’s wider, it just overflows horizontally
-
-    # ---- Build table data (plain strings, no Paragraphs => no wrapping) ----
     header_row = [str(col) for col in cols]
     data_rows = []
     for _, row in df_str.iterrows():
         data_rows.append([str(val) for val in row])
 
     data = [header_row] + data_rows
-
     table = Table(data, colWidths=col_widths_pts, repeatRows=1)
 
-    # Blue header, gray banded rows (Excel-like)
-    header_blue = colors.HexColor("#4472C4")      # Excel blue
+    header_blue = colors.HexColor("#4472C4")
     band_gray = colors.HexColor("#D9D9D9")
 
     style = TableStyle(
@@ -428,25 +478,16 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
             ("BACKGROUND", (0, 0), (-1, 0), header_blue),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-
             ("FONTNAME", (0, 0), (-1, 0), header_font_name),
             ("FONTSIZE", (0, 0), (-1, 0), header_font_size),
-
             ("FONTNAME", (0, 1), (-1, -1), body_font_name),
             ("FONTSIZE", (0, 1), (-1, -1), body_font_size),
-
             ("ALIGN", (0, 0), (-1, 0), "CENTER"),
             ("ALIGN", (0, 1), (-1, -1), "CENTER"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ]
     )
-    # gray banded rows for data (starting from row 1 = first data row)
-    style.add(
-        "ROWBACKGROUNDS",
-        (0, 1),
-        (-1, -1),
-        [colors.whitesmoke, band_gray],
-    )
+    style.add("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, band_gray])
 
     table.setStyle(style)
 
@@ -457,13 +498,13 @@ def dataframe_to_pdf_bytes(df: pd.DataFrame, title: str = "") -> bytes:
 
 
 def auto_fit_excel_columns(writer, sheet_name: str):
-    """Auto-fit column widths AND convert the data range to an Excel Table."""
+    """Auto-fit columns AND convert range to a styled Excel Table."""
     try:
         ws = writer.sheets[sheet_name]
     except KeyError:
         return
 
-    # --- Auto-fit column widths ---
+    # Auto-fit widths
     for column_cells in ws.columns:
         max_length = 0
         col = column_cells[0].column_letter
@@ -474,10 +515,9 @@ def auto_fit_excel_columns(writer, sheet_name: str):
                 cell_val = ""
             if len(cell_val) > max_length:
                 max_length = len(cell_val)
-        adjusted_width = max_length + 2
-        ws.column_dimensions[col].width = adjusted_width
+        ws.column_dimensions[col].width = max_length + 2
 
-    # --- Convert used range to a styled Excel Table ---
+    # Convert to Table
     try:
         if ws.max_row < 1 or ws.max_column < 1:
             return
@@ -486,7 +526,6 @@ def auto_fit_excel_columns(writer, sheet_name: str):
         last_col = get_column_letter(ws.max_column)
         ref = f"{first_col}1:{last_col}{ws.max_row}"
 
-        # Build a safe, unique table name based on the sheet name
         base_name = re.sub(r"\W+", "_", sheet_name) or "Table"
         existing = {tbl.displayName for tbl in ws._tables}
         name = base_name
@@ -495,29 +534,21 @@ def auto_fit_excel_columns(writer, sheet_name: str):
             idx += 1
             name = f"{base_name}_{idx}"
 
-        table = XLTable(displayName=name, ref=ref)
+        tbl = XLTable(displayName=name, ref=ref)
         style = TableStyleInfo(
-            name="TableStyleMedium9",   # blue header + banded rows
+            name="TableStyleMedium9",
             showFirstColumn=False,
             showLastColumn=False,
             showRowStripes=True,
             showColumnStripes=False,
         )
-        table.tableStyleInfo = style
-        ws.add_table(table)
+        tbl.tableStyleInfo = style
+        ws.add_table(tbl)
     except Exception:
-        # best-effort; if something fails, we still keep the data
         pass
 
-def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_list):
-    """
-    Build in-memory structures for employees:
-    - employees: list of dicts with vendor, emp_id, emp_name, hours, df, flags (only those to be exported)
-    - ignored: employees present in full_df but not in db_df and not starting with 'P'
-    - unassigned: P* employees not in db but assigned to default vendor
-    - project_flagged: employees whose rows contain project types from ignore_list (NOT exported)
-    """
 
+def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_list):
     obj_cols = full_df.select_dtypes(include=["object"]).columns
     full_df[obj_cols] = full_df[obj_cols].ffill()
 
@@ -529,8 +560,6 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
         full_df[FULL_HOURS_COL] = 0.0
 
     db_df = db_df.copy()
-    emp_id_to_vendor = {}
-    emp_id_to_name = {}
 
     if DB_EMP_ID_COL not in db_df.columns or DB_VENDOR_COL not in db_df.columns:
         missing = []
@@ -543,6 +572,8 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
             f"Found columns: {list(db_df.columns)}"
         )
 
+    emp_id_to_vendor = {}
+    emp_id_to_name = {}
     for _, row in db_df.iterrows():
         emp_id = str(row[DB_EMP_ID_COL]).strip()
         vendor = row[DB_VENDOR_COL]
@@ -638,10 +669,14 @@ def prepare_employee_data(full_df: pd.DataFrame, db_df: pd.DataFrame, ignore_lis
 
 def build_summary_structures(employees, ignored, failed, unassigned, project_flagged, full_df, lang: str):
     now = datetime.now()
+    date_min = None
+    date_max = None
     if FULL_DATE_COL in full_df.columns:
         dates = full_df[FULL_DATE_COL].dropna()
         if not dates.empty:
-            period_str = f"{dates.min().date()} → {dates.max().date()}"
+            date_min = dates.min().date()
+            date_max = dates.max().date()
+            period_str = f"{date_min} → {date_max}"
         else:
             period_str = t("no_dates", lang)
     else:
@@ -663,6 +698,8 @@ def build_summary_structures(employees, ignored, failed, unassigned, project_fla
         "failed_emps": failed_emps,
         "unassigned_emps": unassigned_emps,
         "project_flagged_emps": project_flagged_emps,
+        "date_min": date_min,
+        "date_max": date_max,
     }
 
     vendor_summary_rows = []
@@ -759,28 +796,21 @@ def build_docx_summary(
     lang: str,
 ) -> Document:
     doc = Document()
-
     doc.add_heading(t("summary_doc_title", lang), level=0)
 
     doc.add_heading(t("doc_section_overview", lang), level=1)
     ts_str = summary_stats["run_timestamp"].strftime("%Y-%m-%d %H:%M:%S")
     period_str = summary_stats["period"]
-    total = summary_stats["total_emps"]
-    exported = summary_stats["exported_emps"]
-    ignored = summary_stats["ignored_emps"]
-    failed = summary_stats["failed_emps"]
-    unassigned = summary_stats["unassigned_emps"]
-    project_flagged = summary_stats["project_flagged_emps"]
 
     bullets = [
         t("doc_overview_bullet_1", lang).format(ts=ts_str),
         t("doc_overview_bullet_2", lang).format(period=period_str),
-        t("doc_overview_bullet_3", lang).format(total=total),
-        t("doc_overview_bullet_4", lang).format(exported=exported),
-        t("doc_overview_bullet_5", lang).format(ignored=ignored),
-        t("doc_overview_bullet_6", lang).format(failed=failed),
-        t("doc_overview_bullet_7", lang).format(unassigned=unassigned),
-        t("doc_overview_bullet_8", lang).format(project_flagged=project_flagged),
+        t("doc_overview_bullet_3", lang).format(total=summary_stats["total_emps"]),
+        t("doc_overview_bullet_4", lang).format(exported=summary_stats["exported_emps"]),
+        t("doc_overview_bullet_5", lang).format(ignored=summary_stats["ignored_emps"]),
+        t("doc_overview_bullet_6", lang).format(failed=summary_stats["failed_emps"]),
+        t("doc_overview_bullet_7", lang).format(unassigned=summary_stats["unassigned_emps"]),
+        t("doc_overview_bullet_8", lang).format(project_flagged=summary_stats["project_flagged_emps"]),
     ]
     for b in bullets:
         doc.add_paragraph(b, style="List Bullet")
@@ -846,6 +876,196 @@ def build_vendor_staff_summary_df(vendor: str, employees_for_summary: list, lang
     return pd.DataFrame(rows)
 
 
+# ==== Email helpers ====
+
+def collect_vendor_pdf_paths_for_email(
+    output_folder: str, vendor: str, vendor_emps: list, selected_emp_ids: set, file_prefix: str
+):
+    vendor_folder = os.path.join(output_folder, safe_name(vendor))
+    pdf_paths = []
+
+    for emp in vendor_emps:
+        emp_id = emp["Emp ID"]
+        if selected_emp_ids and emp_id not in selected_emp_ids:
+            continue
+        emp_name = emp["Employee Name"]
+        # Use the same naming pattern as the splitter
+        file_base = f"{file_prefix}{vendor}_{emp_name}-{emp_id}.xlsx"
+        safe_file = safe_name(file_base)
+        excel_path = os.path.join(vendor_folder, safe_file)
+        pdf_path = excel_path[:-5] + ".pdf"
+        if os.path.exists(pdf_path):
+            pdf_paths.append(pdf_path)
+
+    # vendor staff summary PDF (keeps its old naming)
+    base_name = safe_name(f"{vendor}-StaffSummary")
+    summary_pdf = os.path.join(vendor_folder, base_name + ".pdf")
+    if os.path.exists(summary_pdf):
+        pdf_paths.append(summary_pdf)
+
+    return pdf_paths
+
+
+def split_files_into_zips(file_paths, max_bytes):
+    groups = []
+    current = []
+    current_size = 0
+    for path in file_paths:
+        size = os.path.getsize(path)
+        if current and current_size + size > max_bytes:
+            groups.append(current)
+            current = []
+            current_size = 0
+        current.append(path)
+        current_size += size
+    if current:
+        groups.append(current)
+    return groups
+
+
+def make_zip_bytes_for_group(vendor: str, file_paths: list, seq_index: int, max_seq: int):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for path in file_paths:
+            arcname = os.path.basename(path)
+            z.write(path, arcname)
+    buf.seek(0)
+    safe_vendor = safe_name(vendor)
+    filename = f"{safe_vendor}_Timesheets_{seq_index}_of_{max_seq}.zip"
+    return buf.getvalue(), filename
+
+
+def send_emails_to_vendors(
+    output_folder: str,
+    vendor_to_emps: dict,
+    selected_vendors: list,
+    selected_employees_by_vendor: dict,
+    vendor_emails: dict,
+    summary_stats: dict,
+    config: dict,
+    lang: str,
+    max_mb: float,
+    delay_sec: float,
+):
+    vendors_no_email = []
+    vendors_no_pdfs = []
+    sent_summary = []
+    error_msg = None
+
+    smtp_server = config.get("email_smtp_server", DEFAULT_CONFIG["email_smtp_server"])
+    smtp_port = int(config.get("email_smtp_port", DEFAULT_CONFIG["email_smtp_port"]))
+    smtp_user = config.get("email_username", "").strip()
+    smtp_password = config.get("email_password", "").strip()
+    from_email = smtp_user
+
+    if not smtp_server or not smtp_user or not smtp_password:
+        return [], selected_vendors, [], t("email_missing_smtp", lang)
+
+    # NEW: file name prefix for locating PDFs
+    file_prefix = config.get("output_file_prefix", DEFAULT_CONFIG["output_file_prefix"])
+
+    max_bytes = max_mb * 1024 * 1024
+
+    dmin = summary_stats.get("date_min")
+    dmax = summary_stats.get("date_max")
+    dmin_str = dmin.isoformat() if isinstance(dmin, (date, datetime)) else "N/A"
+    dmax_str = dmax.isoformat() if isinstance(dmax, (date, datetime)) else "N/A"
+
+    vendors_to_process = []
+    for v in selected_vendors:
+        email = vendor_emails.get(v, "").strip()
+        if not email:
+            vendors_no_email.append(v)
+        else:
+            vendors_to_process.append(v)
+
+    if not vendors_to_process:
+        return [], vendors_no_email, [], None
+
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=60)
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+    except Exception as e:
+        return [], vendors_no_email, [], f"{t('email_error_sending', lang)}: {e}"
+
+    try:
+        total_vendors = len(vendors_to_process)
+        progress = st.progress(0.0)
+        status = st.empty()
+
+        for idx, vendor in enumerate(vendors_to_process, start=1):
+            status.text(t("email_progress_vendor", lang).format(current=idx, total=total_vendors, vendor=vendor))
+
+            emps = vendor_to_emps[vendor]
+            selected_ids = set(selected_employees_by_vendor.get(vendor, []))
+            vendor_pdf_paths = collect_vendor_pdf_paths_for_email(
+                output_folder, vendor, emps, selected_ids, file_prefix
+            )
+
+            if not vendor_pdf_paths:
+                vendors_no_pdfs.append(vendor)
+                progress.progress(idx / total_vendors)
+                continue
+
+            groups = split_files_into_zips(vendor_pdf_paths, max_bytes)
+            max_seq = len(groups)
+            subjects = []
+
+            for seq_idx, group_paths in enumerate(groups, start=1):
+                zip_bytes, zip_filename = make_zip_bytes_for_group(vendor, group_paths, seq_idx, max_seq)
+                subject = (
+                    f"[{vendor}] - Employees Timesheets - {dmin_str} to {dmax_str} - "
+                    f"{seq_idx} out of {max_seq}"
+                )
+                subjects.append(subject)
+
+                msg = EmailMessage()
+                msg["Subject"] = subject
+                msg["From"] = from_email
+                msg["To"] = vendor_emails[vendor]
+
+                body_lines = [
+                    f"Vendor: {vendor}",
+                    "",
+                    "Please find attached a ZIP file containing the employee timesheet PDFs and vendor summary.",
+                ]
+                msg.set_content("\n".join(body_lines))
+
+                msg.add_attachment(
+                    zip_bytes,
+                    maintype="application",
+                    subtype="zip",
+                    filename=zip_filename,
+                )
+
+                server.send_message(msg)
+                time.sleep(delay_sec)
+
+            sent_summary.append(
+                {
+                    t("email_sent_row_vendor", lang): vendor,
+                    t("email_sent_row_email", lang): vendor_emails[vendor],
+                    t("email_sent_row_emps", lang): len(selected_ids),
+                    t("email_sent_row_zips", lang): max_seq,
+                    t("email_sent_row_subjects", lang): " | ".join(subjects),
+                }
+            )
+
+            progress.progress(idx / total_vendors)
+
+        server.quit()
+    except Exception as e:
+        error_msg = f"{t('email_error_sending', lang)}: {e}"
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+
+    return sent_summary, vendors_no_email, vendors_no_pdfs, error_msg
+
+
 # ==== Streamlit pages ====
 
 def run_main_page(config: dict, lang: str):
@@ -898,7 +1118,6 @@ def run_main_page(config: dict, lang: str):
         full_file = st.file_uploader(t("full_timesheet", lang), type=["xlsx"])
     with col2:
         if db_loaded_from_config:
-            # Small label with check mark, no big success box
             label = f"{t('vendor_db', lang)} ✅"
             db_file = st.file_uploader(
                 label,
@@ -929,6 +1148,9 @@ def run_main_page(config: dict, lang: str):
     start = st.button(t("start", lang), type="primary", disabled=disable_start)
 
     if not start:
+        # If there is previous email context, show email UI below
+        if "email_context" in st.session_state:
+            run_email_section(config, lang)
         return
 
     try:
@@ -950,6 +1172,8 @@ def run_main_page(config: dict, lang: str):
             full_df, db_df, ignore_list
         )
 
+        file_prefix = config.get("output_file_prefix", DEFAULT_CONFIG["output_file_prefix"])
+
         total_to_process = len(employees)
         failed = []
         successful_employees = []
@@ -969,10 +1193,7 @@ def run_main_page(config: dict, lang: str):
                 return
 
         zip_buffer = io.BytesIO() if output_mode == "zip" else None
-        if zip_buffer is not None:
-            zip_file = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED)
-        else:
-            zip_file = None
+        zip_file = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) if zip_buffer is not None else None
 
         for idx, emp in enumerate(employees, start=1):
             emp_id = emp["Emp ID"]
@@ -989,7 +1210,7 @@ def run_main_page(config: dict, lang: str):
                 )
 
                 safe_vendor_folder = safe_name(vendor)
-                file_base_name = f"{vendor}-{emp_id}-{emp_name}.xlsx"
+                file_base_name = f"{file_prefix}{vendor}_{emp_name}-{emp_id}.xlsx"
                 safe_file_name = safe_name(file_base_name)
 
                 if output_mode == "folder":
@@ -997,24 +1218,17 @@ def run_main_page(config: dict, lang: str):
                     os.makedirs(vendor_folder_path, exist_ok=True)
                     file_path = os.path.join(vendor_folder_path, safe_file_name)
 
-                    # Excel with auto-fit columns
                     with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
                         emp_df.to_excel(writer, index=False, sheet_name="Timesheet")
                         auto_fit_excel_columns(writer, "Timesheet")
 
-                    # PDF (A1 landscape, wide columns)
                     if REPORTLAB_AVAILABLE:
                         pdf_bytes = dataframe_to_pdf_bytes(emp_df, title=file_base_name)
-                        pdf_path = (
-                            file_path[:-5] + ".pdf"
-                            if file_path.lower().endswith(".xlsx")
-                            else file_path + ".pdf"
-                        )
+                        pdf_path = file_path[:-5] + ".pdf"
                         with open(pdf_path, "wb") as pf:
                             pf.write(pdf_bytes)
 
                 else:
-                    # Excel to ZIP with auto-fit
                     xls_buffer = io.BytesIO()
                     with pd.ExcelWriter(xls_buffer, engine="openpyxl") as writer:
                         emp_df.to_excel(writer, index=False, sheet_name="Timesheet")
@@ -1023,13 +1237,9 @@ def run_main_page(config: dict, lang: str):
                     arcname = f"{safe_vendor_folder}/{safe_file_name}"
                     zip_file.writestr(arcname, xls_buffer.getvalue())
 
-                    # PDF inside ZIP
                     if REPORTLAB_AVAILABLE:
                         pdf_bytes = dataframe_to_pdf_bytes(emp_df, title=file_base_name)
-                        if safe_file_name.lower().endswith(".xlsx"):
-                            pdf_name = safe_file_name[:-5] + ".pdf"
-                        else:
-                            pdf_name = safe_file_name + ".pdf"
+                        pdf_name = safe_file_name[:-5] + ".pdf"
                         pdf_arcname = f"{safe_vendor_folder}/{pdf_name}"
                         zip_file.writestr(pdf_arcname, pdf_bytes)
 
@@ -1091,6 +1301,15 @@ def run_main_page(config: dict, lang: str):
             v = emp["Vendor"]
             vendor_to_emps.setdefault(v, []).append(emp)
 
+        # Save email context for later use
+        st.session_state["email_context"] = {
+            "output_mode": output_mode,
+            "output_folder": output_mode == "folder" and output_folder or None,
+            "vendor_to_emps": vendor_to_emps,
+            "summary_stats": summary_stats,
+        }
+
+        # Per-vendor staff summary
         if output_mode == "folder":
             for vendor, emps_list in vendor_to_emps.items():
                 safe_vendor_folder = safe_name(vendor)
@@ -1100,13 +1319,11 @@ def run_main_page(config: dict, lang: str):
                 vendor_summary_df_vendor = build_vendor_staff_summary_df(vendor, emps_list, lang)
                 base_name = safe_name(f"{vendor}-StaffSummary")
 
-                # Excel per vendor with auto-fit
                 vendor_summary_xlsx_path = os.path.join(vendor_folder_path, base_name + ".xlsx")
                 with pd.ExcelWriter(vendor_summary_xlsx_path, engine="openpyxl") as writer:
                     vendor_summary_df_vendor.to_excel(writer, index=False, sheet_name="Summary")
                     auto_fit_excel_columns(writer, "Summary")
 
-                # PDF per vendor
                 if REPORTLAB_AVAILABLE:
                     pdf_bytes = dataframe_to_pdf_bytes(
                         vendor_summary_df_vendor, title=f"{vendor} - Staff Summary"
@@ -1123,7 +1340,6 @@ def run_main_page(config: dict, lang: str):
                         vendor_summary_df_vendor = build_vendor_staff_summary_df(vendor, emps_list, lang)
                         base_name = safe_name(f"{vendor}-StaffSummary")
 
-                        # Excel per vendor in ZIP
                         xls_buf = io.BytesIO()
                         with pd.ExcelWriter(xls_buf, engine="openpyxl") as writer:
                             vendor_summary_df_vendor.to_excel(writer, index=False, sheet_name="Summary")
@@ -1132,7 +1348,6 @@ def run_main_page(config: dict, lang: str):
                         arcname_xlsx = f"{safe_vendor_folder}/{base_name}.xlsx"
                         zip_file_append.writestr(arcname_xlsx, xls_buf.getvalue())
 
-                        # PDF per vendor in ZIP
                         if REPORTLAB_AVAILABLE:
                             pdf_bytes = dataframe_to_pdf_bytes(
                                 vendor_summary_df_vendor, title=f"{vendor} - Staff Summary"
@@ -1175,10 +1390,7 @@ def run_main_page(config: dict, lang: str):
         c3.metric(t("metric_ignored_emps", lang), summary_stats["ignored_emps"])
         c4.metric(t("metric_failed_emps", lang), summary_stats["failed_emps"])
         c5.metric(t("metric_unassigned_emps", lang), summary_stats["unassigned_emps"])
-        c6.metric(
-            t("metric_project_flagged_emps", lang),
-            summary_stats["project_flagged_emps"],
-        )
+        c6.metric(t("metric_project_flagged_emps", lang), summary_stats["project_flagged_emps"])
 
         st.markdown("----")
         c7, c8 = st.columns(2)
@@ -1240,8 +1452,116 @@ def run_main_page(config: dict, lang: str):
                     mime="application/zip",
                 )
 
+        # Email section
+        run_email_section(config, lang)
+
     except Exception as e:
         st.error(f"{t('fatal_error', lang)}: {e}")
+
+
+def run_email_section(config: dict, lang: str):
+    ctx = st.session_state.get("email_context")
+    if not ctx:
+        return
+
+    st.markdown("### 📧 " + t("email_section_title", lang))
+
+    if ctx.get("output_mode") != "folder" or not ctx.get("output_folder"):
+        st.info(t("email_requires_folder", lang))
+        return
+
+    output_folder = ctx["output_folder"]
+    vendor_to_emps = ctx["vendor_to_emps"]
+    summary_stats = ctx["summary_stats"]
+
+    if not vendor_to_emps:
+        return
+
+    smtp_server = config.get("email_smtp_server", DEFAULT_CONFIG["email_smtp_server"])
+    smtp_port = int(config.get("email_smtp_port", DEFAULT_CONFIG["email_smtp_port"]))
+    smtp_user = config.get("email_username", "").strip()
+    smtp_password = config.get("email_password", "").strip()
+    max_mb = float(config.get("email_max_attachment_mb", DEFAULT_CONFIG["email_max_attachment_mb"]))
+    delay_sec = float(config.get("email_delay_seconds", DEFAULT_CONFIG["email_delay_seconds"]))
+    vendor_emails_cfg = config.get("vendor_emails", {}) or {}
+
+    if not smtp_server or not smtp_user or not smtp_password:
+        st.warning(t("email_missing_smtp", lang))
+        return
+
+    all_vendors = sorted(vendor_to_emps.keys())
+    selected_vendors = st.multiselect(
+        t("email_vendors_label", lang),
+        all_vendors,
+        default=all_vendors,
+        key="email_vendors",
+    )
+
+    if not selected_vendors:
+        return
+
+    selected_employees_by_vendor = {}
+    current_vendor_emails = {}
+
+    for vendor in selected_vendors:
+        emps = vendor_to_emps[vendor]
+        default_email = vendor_emails_cfg.get(vendor, "")
+        with st.expander(vendor, expanded=False):
+            email_val = st.text_input(
+                t("email_vendor_address", lang),
+                value=default_email,
+                key=f"vend_email_{vendor}",
+            )
+            current_vendor_emails[vendor] = email_val.strip()
+
+            emp_labels = [f"{e['Emp ID']} - {e['Employee Name']}" for e in emps]
+            emp_ids = [e["Emp ID"] for e in emps]
+            selected_labels = st.multiselect(
+                t("email_emps_label", lang),
+                emp_labels,
+                default=emp_labels,
+                key=f"vend_emps_{vendor}",
+            )
+            selected_ids = [emp_ids[i] for i, lbl in enumerate(emp_labels) if lbl in selected_labels]
+            selected_employees_by_vendor[vendor] = selected_ids
+
+    send_clicked = st.button(t("email_start_button", lang), type="primary")
+
+    if send_clicked:
+        sent_summary, vendors_no_email, vendors_no_pdfs, error_msg = send_emails_to_vendors(
+            output_folder,
+            vendor_to_emps,
+            selected_vendors,
+            selected_employees_by_vendor,
+            current_vendor_emails,
+            summary_stats,
+            config,
+            lang,
+            max_mb,
+            delay_sec,
+        )
+
+        if error_msg:
+            st.error(error_msg)
+
+        if vendors_no_email:
+            st.warning(t("email_no_vendor_email", lang) + " " + ", ".join(vendors_no_email))
+
+        if vendors_no_pdfs:
+            st.warning(t("email_no_pdfs", lang) + " " + ", ".join(vendors_no_pdfs))
+
+        if sent_summary:
+            st.success(t("email_completed", lang))
+            st.markdown("#### " + t("email_summary_title", lang))
+            st.dataframe(pd.DataFrame(sent_summary), use_container_width=True)
+
+            # persist vendor emails to config
+            cfg_emails = config.get("vendor_emails", {}) or {}
+            for v in selected_vendors:
+                if current_vendor_emails.get(v):
+                    cfg_emails[v] = current_vendor_emails[v]
+            config["vendor_emails"] = cfg_emails
+            save_app_config(config)
 
 
 def run_settings_page(config: dict, lang: str):
@@ -1266,8 +1586,6 @@ def run_settings_page(config: dict, lang: str):
     if db_path:
         resolved = resolve_path_from_config(db_path)
         st.caption(f"{t('config_db_resolved', lang)}: {resolved}")
-    else:
-        resolved = ""
 
     st.markdown(f"### 🎨 {t('config_section_branding', lang)}")
     dept_name = st.text_input(
@@ -1300,6 +1618,11 @@ def run_settings_page(config: dict, lang: str):
         value=cfg.get("default_output_folder", DEFAULT_CONFIG["default_output_folder"]),
     )
 
+    file_prefix = st.text_input(
+        t("config_output_prefix", lang),
+        value=cfg.get("output_file_prefix", DEFAULT_CONFIG["output_file_prefix"]),
+    )    
+
     st.markdown(f"### 🚫 {t('config_section_ignore', lang)}")
     ignore_list = cfg.get("ignore_project_types", DEFAULT_IGNORE_LIST)
     ignore_df = pd.DataFrame({"Project Type": ignore_list})
@@ -1307,6 +1630,46 @@ def run_settings_page(config: dict, lang: str):
         ignore_df,
         num_rows="dynamic",
         key="ignore_editor",
+    )
+
+    # Email settings
+    st.markdown(f"### 📧 {t('config_email_section', lang)}")
+    smtp_server = st.text_input(
+        t("config_email_server", lang),
+        value=cfg.get("email_smtp_server", DEFAULT_CONFIG["email_smtp_server"]),
+    )
+    smtp_port = st.number_input(
+        t("config_email_port", lang),
+        value=int(cfg.get("email_smtp_port", DEFAULT_CONFIG["email_smtp_port"])),
+    )
+    smtp_user = st.text_input(
+        t("config_email_username", lang),
+        value=cfg.get("email_username", DEFAULT_CONFIG["email_username"]),
+    )
+    smtp_password = st.text_input(
+        t("config_email_password", lang),
+        value=cfg.get("email_password", DEFAULT_CONFIG["email_password"]),
+        type="password",
+    )
+    max_mb = st.number_input(
+        t("config_email_max_mb", lang),
+        value=float(cfg.get("email_max_attachment_mb", DEFAULT_CONFIG["email_max_attachment_mb"])),
+        min_value=1.0,
+    )
+    delay_sec = st.number_input(
+        t("config_email_delay", lang),
+        value=float(cfg.get("email_delay_seconds", DEFAULT_CONFIG["email_delay_seconds"])),
+        min_value=0.0,
+    )
+
+    st.markdown(f"### 📮 {t('config_vendor_emails', lang)}")
+    vendor_emails = cfg.get("vendor_emails", {}) or {}
+    vendor_email_rows = [{"Vendor": v, "Email": e} for v, e in vendor_emails.items()]
+    vendor_email_df = pd.DataFrame(vendor_email_rows or [{"Vendor": "", "Email": ""}])
+    edited_vendor_email_df = st.data_editor(
+        vendor_email_df,
+        num_rows="dynamic",
+        key="vendor_email_editor",
     )
 
     if st.button(t("config_save_button", lang)):
@@ -1317,6 +1680,8 @@ def run_settings_page(config: dict, lang: str):
         new_cfg["user_name"] = user_name.strip() or DEFAULT_CONFIG["user_name"]
         new_cfg["default_output_mode"] = out_mode
         new_cfg["default_output_folder"] = out_folder.strip() or DEFAULT_CONFIG["default_output_folder"]
+        new_cfg["output_file_prefix"] = file_prefix.strip() or DEFAULT_CONFIG["output_file_prefix"]
+
 
         try:
             new_ignore_list = [
@@ -1329,6 +1694,24 @@ def run_settings_page(config: dict, lang: str):
         if not new_ignore_list:
             new_ignore_list = DEFAULT_IGNORE_LIST
         new_cfg["ignore_project_types"] = new_ignore_list
+
+        new_cfg["email_smtp_server"] = smtp_server.strip()
+        new_cfg["email_smtp_port"] = int(smtp_port)
+        new_cfg["email_username"] = smtp_user.strip()
+        new_cfg["email_password"] = smtp_password
+        new_cfg["email_max_attachment_mb"] = float(max_mb)
+        new_cfg["email_delay_seconds"] = float(delay_sec)
+
+        new_vendor_emails = {}
+        try:
+            for _, row in edited_vendor_email_df.iterrows():
+                v = str(row.get("Vendor", "")).strip()
+                e = str(row.get("Email", "")).strip()
+                if v and e:
+                    new_vendor_emails[v] = e
+        except Exception:
+            pass
+        new_cfg["vendor_emails"] = new_vendor_emails
 
         save_app_config(new_cfg)
         st.success(t("config_saved", lang))
